@@ -1,0 +1,172 @@
+# scripts/lib/alpha.sh -- shared Dgraph Alpha lifecycle + safety helpers.
+#
+# SOURCE THIS, do not exec. Usage:
+#
+#   set -euo pipefail
+#   BENCH_DIR=...; DGRAPH_REPO=...; ALPHA_DIR=...; ALPHA_DIR_PREFIX_ALLOW=...
+#   DATASETS=( kgs datagen-7_5-fb )
+#   source "$(dirname "${BASH_SOURCE[0]}")/lib/alpha.sh"
+#   trap alpha_cleanup_on_exit EXIT
+#
+# Required env from the caller (set BEFORE calling any function below):
+#   BENCH_DIR                  -- for bulk_p_for() convention path
+#   ALPHA_DIR                  -- workspace for alpha (p/t/w/zw + logs)
+#   ALPHA_DIR_PREFIX_ALLOW     -- safety whitelist for rm operations
+#   ALPHA_HEALTH_URL           -- e.g. http://localhost:8080/health
+#   DATASETS                   -- bash array; guard_rm_target uses it to
+#                                 protect each dataset's bulk p/ from rm
+#
+# Optional env (defaults if unset):
+#   ALPHA_HEALTH_TIMEOUT_SEC   -- 300 -- wait_alpha timeout
+#   ZERO_STATE_URL             -- required for require_zero(no-arg form)
+#   BULK_P_<DS_UPPER>          -- override per-dataset bulk p/ path
+#                                 (DS uppercased; -/. -> _; e.g. BULK_P_DATAGEN_7_5_FB)
+#
+# Functions provided:
+#   ts log die warn             -- logging
+#   size_of <path>              -- human-readable du of one path
+#   bulk_p_for <dataset>        -- BULK_P_<DS> env wins else convention path
+#   guard_rm_target <path>      -- die if path is unsafe to rm
+#   stop_alpha                  -- stop any running alpha (managed + stray)
+#   wait_alpha                  -- block until /health healthy, or timeout
+#   reset_data <bulk_p>         -- wipe ALPHA_DIR/{p,t,w,zw}, cp bulk_p -> p
+#   start_alpha <logfile>       -- launch alpha (background), record pid
+#   require_zero [url]          -- die unless Zero is reachable
+#   to_seconds <dur>            -- "5m"/"60s"/"90" -> integer seconds
+#   alpha_cleanup_on_exit       -- EXIT-trap target; stops alpha if we started it
+#
+# State maintained:
+#   RUNNING_ALPHA               -- 0/1 flag, set by start_alpha / stop_alpha
+#   /tmp/dgraph-alpha.pid       -- pid file written by start_alpha
+
+ALPHA_HEALTH_TIMEOUT_SEC="${ALPHA_HEALTH_TIMEOUT_SEC:-300}"
+RUNNING_ALPHA="${RUNNING_ALPHA:-0}"
+
+ts()   { date +'%Y-%m-%d %H:%M:%S'; }
+log()  { echo "[$(ts)] $*"; }
+die()  { echo "[$(ts)] ERROR: $*" >&2; exit 1; }
+warn() { echo "[$(ts)] WARN: $*" >&2; }
+
+size_of() {
+    if [[ -e "$1" ]]; then du -sh "$1" 2>/dev/null | awk '{print $1}'; else echo "(absent)"; fi
+}
+
+bulk_p_for() {
+    local ds="$1"
+    local upper
+    upper=$(printf '%s' "$ds" | tr '[:lower:]-.' '[:upper:]__')
+    local var="BULK_P_$upper"
+    if [[ -n "${!var:-}" ]]; then
+        echo "${!var}"
+    else
+        echo "${BENCH_DIR}/datasets/$ds/dgraph/bulk-out/0/p"
+    fi
+}
+
+guard_rm_target() {
+    local t="$1"
+    [[ -n "$t" ]]                              || die "rm target empty"
+    [[ "$t" == /* ]]                           || die "rm target not absolute: $t"
+    [[ "$t" != "/" ]]                          || die "refusing to rm /"
+    [[ "$t" != "$HOME" ]]                      || die "refusing to rm \$HOME ($HOME)"
+    [[ -n "${ALPHA_DIR_PREFIX_ALLOW:-}" ]]     || die "ALPHA_DIR_PREFIX_ALLOW unset in caller"
+    [[ "$t" == "$ALPHA_DIR_PREFIX_ALLOW"* ]]   || die "rm target not under allowed prefix: $t"
+    if declare -p DATASETS >/dev/null 2>&1; then
+        for ds in "${DATASETS[@]}"; do
+            local bp
+            bp=$(bulk_p_for "$ds")
+            case "$bp" in
+                "$t"|"$t"/*) die "refusing to rm $t -- would clobber BULK_P for $ds ($bp)" ;;
+            esac
+        done
+    fi
+}
+
+stop_alpha() {
+    if [[ -f /tmp/dgraph-alpha.pid ]]; then
+        local pid
+        pid=$(cat /tmp/dgraph-alpha.pid)
+        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 1 30); do
+                kill -0 "$pid" 2>/dev/null || { rm -f /tmp/dgraph-alpha.pid; RUNNING_ALPHA=0; return 0; }
+                sleep 1
+            done
+            kill -9 "$pid" 2>/dev/null || true
+            sleep 2
+        fi
+        rm -f /tmp/dgraph-alpha.pid
+    fi
+    pgrep -af 'dgraph alpha' >/dev/null 2>&1 || { RUNNING_ALPHA=0; return 0; }
+    pgrep -af 'dgraph alpha' 2>/dev/null | while IFS= read -r line; do
+        local pid cmd
+        pid=$(awk '{print $1}' <<< "$line")
+        cmd=$(awk '{$1=""; sub(/^ /, ""); print}' <<< "$line")
+        if [[ "$cmd" =~ ^(/[^[:space:]]+/)?dgraph[[:space:]]+alpha([[:space:]]|$) ]]; then
+            kill "$pid" 2>/dev/null || true
+        fi
+    done
+    sleep 2
+    RUNNING_ALPHA=0
+}
+
+wait_alpha() {
+    [[ -n "${ALPHA_HEALTH_URL:-}" ]] || die "ALPHA_HEALTH_URL unset in caller"
+    local deadline=$(( $(date +%s) + ALPHA_HEALTH_TIMEOUT_SEC ))
+    while (( $(date +%s) < deadline )); do
+        if curl -s -m 3 "$ALPHA_HEALTH_URL" 2>/dev/null | grep -q '"status":"healthy"'; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+reset_data() {
+    local bulk_p="$1"
+    [[ -n "${ALPHA_DIR:-}" ]] || die "ALPHA_DIR unset in caller"
+    for d in p t w zw; do
+        local target="$ALPHA_DIR/$d"
+        guard_rm_target "$target"
+        if [[ -e "$target" ]]; then
+            log "  rm -rf $target (size $(size_of "$target"))"
+            rm -rf "$target"
+        fi
+    done
+    log "  cp -r $bulk_p (size $(size_of "$bulk_p")) -> $ALPHA_DIR/p"
+    cp -r "$bulk_p" "$ALPHA_DIR/p"
+}
+
+start_alpha() {
+    local logfile="$1"
+    [[ -n "${ALPHA_DIR:-}" ]] || die "ALPHA_DIR unset in caller"
+    ( cd "$ALPHA_DIR"
+      nohup dgraph alpha --limit "query-edge=50000000" \
+          > "$logfile" 2>&1 &
+      echo $! > /tmp/dgraph-alpha.pid
+    )
+    RUNNING_ALPHA=1
+}
+
+require_zero() {
+    local url="${1:-${ZERO_STATE_URL:-}}"
+    [[ -n "$url" ]] || die "require_zero: no URL passed and ZERO_STATE_URL unset"
+    curl -s -m 5 "$url" >/dev/null 2>&1 \
+        || die "zero is not reachable at $url -- start it before running"
+}
+
+to_seconds() {
+    local v="$1"
+    case "$v" in
+        *m) echo $(( ${v%m} * 60 )) ;;
+        *s) echo "${v%s}" ;;
+        *)  echo "$v" ;;
+    esac
+}
+
+alpha_cleanup_on_exit() {
+    if [[ ${RUNNING_ALPHA:-0} -eq 1 ]]; then
+        log "cleanup_on_exit: stopping alpha we started"
+        stop_alpha 2>/dev/null || true
+    fi
+}
