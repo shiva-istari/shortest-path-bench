@@ -24,8 +24,9 @@
 # Override anything via env:
 #   BENCH_DIR DGRAPH_REPO ALPHA_DIR
 #   BRANCHES_OVERRIDE="main pr-9576"
-#   DATASETS_OVERRIDE="kgs datagen-7_5-fb"
+#   DATASETS_OVERRIDE="kgs"  (FB is intentionally disabled -- see DATASETS check below)
 #   PROBE_TIMEOUT=5m
+#   PROBE_MAXFRONTIER=1000   (the cap used for the discriminator numpaths=2 query)
 #   BULK_P_<DATASET_UPPER>=/path/to/p   (e.g. BULK_P_KGS=...)
 #
 # Typical invocation on the benchmark VM:
@@ -48,8 +49,17 @@ ALPHA_DIR_PREFIX_ALLOW="${ALPHA_DIR_PREFIX_ALLOW:-/Users/shiva/workspace/}"
 BRANCHES_STR="${BRANCHES_OVERRIDE:-main pr-9576 pr-9599 pr-9607 pr-9678}"
 read -ra BRANCHES <<< "$BRANCHES_STR"
 
-DATASETS_STR="${DATASETS_OVERRIDE:-kgs datagen-7_5-fb}"
+# FB (datagen-7_5-fb) is intentionally disabled on this VM tier -- the bug's
+# uncapped frontier explosion saturates pd-ssd disk throughput and wedges the
+# VM. KGS-only verification is the current scope.
+DATASETS_STR="${DATASETS_OVERRIDE:-kgs}"
 read -ra DATASETS <<< "$DATASETS_STR"
+for _ds in "${DATASETS[@]}"; do
+    if [[ "$_ds" == "datagen-7_5-fb" || "$_ds" == "datagen-7.5-fb" ]]; then
+        echo "[$(date +'%Y-%m-%d %H:%M:%S')] ERROR: datagen-7_5-fb is disabled. Use a larger pd-ssd disk (>=500GB) to re-enable, then remove this check." >&2
+        exit 1
+    fi
+done
 
 ALPHA_HTTP_URL="${ALPHA_HTTP_URL:-http://localhost:8080}"
 ALPHA_HEALTH_URL="$ALPHA_HTTP_URL/health"
@@ -58,6 +68,10 @@ ALPHA_GRPC="${ALPHA_GRPC:-localhost:9080}"
 ZERO_STATE_URL="${ZERO_STATE_URL:-http://localhost:6080/state}"
 
 PROBE_TIMEOUT="${PROBE_TIMEOUT:-5m}"
+# Cap used in the numpaths=2 discriminator query. The PRs' bug is in eviction
+# logic when this cap is HIT, so it must be set to actually test the bug.
+# 1000 matches the README's headline workload value.
+PROBE_MAXFRONTIER="${PROBE_MAXFRONTIER:-1000}"
 NUMPATH1_TIMEOUT="${NUMPATH1_TIMEOUT:-2m}"
 ALPHA_HEALTH_TIMEOUT_SEC="${ALPHA_HEALTH_TIMEOUT_SEC:-300}"
 MIN_FREE_DISK_GB="${MIN_FREE_DISK_GB:-20}"
@@ -108,13 +122,22 @@ run_shortest() {
     local numpaths="$3"
     local timeout_s="$4"
     local outfile="$5"
+    local maxfrontier="${6:-}"
+
+    # If a cap is requested, splice it into the DQL shortest() call.
+    # Without this clause, k-shortest is unbounded -- which is fundamentally
+    # different from what the PRs are supposed to fix.
+    local cap_clause=""
+    if [[ -n "$maxfrontier" && "$maxfrontier" -gt 0 ]]; then
+        cap_clause=", maxfrontiersize: $maxfrontier"
+    fi
 
     local start end wall rc
     start=$(date +%s)
     set +e
     curl -s --max-time "$timeout_s" -H 'Content-Type: application/dql' \
         -X POST "$ALPHA_QUERY_URL" --data \
-        "{ path as shortest(from: $src_uid, to: $dst_uid, numpaths: $numpaths) {
+        "{ path as shortest(from: $src_uid, to: $dst_uid, numpaths: $numpaths$cap_clause) {
              connected @facets(weight)
            }
            result(func: uid(path)) { uid }
@@ -155,6 +178,7 @@ log "  ALPHA_DIR_PREFIX_ALLOW = $ALPHA_DIR_PREFIX_ALLOW"
 log "  branches               = ${BRANCHES[*]}"
 log "  datasets               = ${DATASETS[*]}"
 log "  probe timeout          = $PROBE_TIMEOUT (numpaths>=2)"
+log "  probe maxfrontier      = $PROBE_MAXFRONTIER (cap on numpaths=2 query)"
 log "  numpaths=1 timeout     = $NUMPATH1_TIMEOUT (sanity)"
 log "  alpha-health timeout   = ${ALPHA_HEALTH_TIMEOUT_SEC}s"
 
@@ -312,7 +336,8 @@ for branch in "${BRANCHES[@]}"; do
         np2_to=$(to_seconds "$PROBE_TIMEOUT")
         IFS=$'\t' read -r np2_status np2_wall np2_paths < <(
             run_shortest "$src_uid" "$dst_uid" 2 "$np2_to" \
-                "$RESULTS_DIR/probe-$branch-$ds-np2.json"
+                "$RESULTS_DIR/probe-$branch-$ds-np2.json" \
+                "$PROBE_MAXFRONTIER"
         )
         NP2_WALL["$cell"]="$np2_wall"
         NP2_PATHS["$cell"]="$np2_paths"
