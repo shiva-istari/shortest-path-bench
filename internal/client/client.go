@@ -169,6 +169,17 @@ type ShortestResult struct {
 	// PathCount is the number of distinct paths in the response (1 for the
 	// classic shortest, up to NumPaths for k-shortest).
 	PathCount int
+	// SelfConsistent is true when, for every returned path, the sum of the
+	// per-edge weight facets equals the path's reported _weight_ (within
+	// tolerance). This needs no oracle: a path whose own edges don't add up to
+	// its claimed cost is a bug. False if any path fails or can't be walked.
+	SelfConsistent bool
+	// Loopless is true when no returned path revisits a uid. Dgraph claims to
+	// prune cyclical paths; a repeated uid would contradict that.
+	Loopless bool
+	// MaxWeightErr is the largest absolute |summed - reported| across paths,
+	// for diagnostics when SelfConsistent is false.
+	MaxWeightErr float64
 }
 
 // Shortest issues one `shortest` query and decodes total weight from the
@@ -224,10 +235,28 @@ func (c *Client) Shortest(ctx context.Context, opts ShortestOptions) (ShortestRe
 	}
 
 	weights := make([]float64, 0, len(decoded.Paths))
+	selfConsistent, loopless := true, true
+	maxErr := 0.0
 	for _, p := range decoded.Paths {
-		if raw, ok := p["_weight_"]; ok {
-			if f, ok := toFloat(raw); ok {
-				weights = append(weights, f)
+		reported, hasReported := toFloat(p["_weight_"])
+		if hasReported {
+			weights = append(weights, reported)
+		}
+		// Walk the nested path to sum edge facets and check for loops.
+		summed, noLoop, ok := walkPath(p, edge)
+		if !ok || !noLoop {
+			loopless = loopless && noLoop
+			selfConsistent = false
+			continue
+		}
+		if hasReported {
+			if e := math.Abs(summed - reported); e > maxErr {
+				maxErr = e
+			}
+			// 1e-6 absolute plus a relative term absorbs float-facet summation
+			// noise without masking a real discrepancy.
+			if math.Abs(summed-reported) > 1e-6+1e-9*math.Abs(reported) {
+				selfConsistent = false
 			}
 		}
 	}
@@ -237,11 +266,60 @@ func (c *Client) Shortest(ctx context.Context, opts ShortestOptions) (ShortestRe
 		best = weights[0]
 	}
 	return ShortestResult{
-		Distance:  best,
-		Weights:   weights,
-		Latency:   elapsed,
-		PathCount: len(decoded.Paths),
+		Distance:       best,
+		Weights:        weights,
+		Latency:        elapsed,
+		PathCount:      len(decoded.Paths),
+		SelfConsistent: selfConsistent,
+		Loopless:       loopless,
+		MaxWeightErr:   maxErr,
 	}, nil
+}
+
+// walkPath descends the singly-nested path under the edge predicate, summing
+// the per-edge weight facets (key "<edge>|weight", carried on each child node
+// next to its uid) and checking that no uid repeats. Returns the summed edge
+// weight, whether the path is loopless, and whether the structure parsed
+// cleanly. Matches the real _path_ wire format:
+//
+//	{"_weight_":3,"uid":"0x1","connected":{"connected|weight":1,"uid":"0x2",
+//	  "connected":{...}}}
+func walkPath(root map[string]any, edge string) (total float64, noLoop bool, ok bool) {
+	facetKey := edge + "|weight"
+	seen := make(map[string]bool)
+	cur := root
+	if u, has := cur["uid"].(string); has {
+		seen[u] = true
+	}
+	for {
+		childRaw, has := cur[edge]
+		if !has {
+			return total, true, true // reached the leaf — clean linear path
+		}
+		child, isMap := childRaw.(map[string]any)
+		if !isMap {
+			// A linear path nests a single object; an array (branching) is
+			// unexpected for k-shortest and we flag it rather than guess.
+			if arr, isArr := childRaw.([]any); isArr && len(arr) == 1 {
+				child, isMap = arr[0].(map[string]any)
+			}
+			if !isMap {
+				return total, true, false
+			}
+		}
+		w, wok := toFloat(child[facetKey])
+		if !wok {
+			return total, true, false
+		}
+		total += w
+		if u, has := child["uid"].(string); has {
+			if seen[u] {
+				return total, false, true // a uid repeated — not loopless
+			}
+			seen[u] = true
+		}
+		cur = child
+	}
 }
 
 func toFloat(v any) (float64, bool) {

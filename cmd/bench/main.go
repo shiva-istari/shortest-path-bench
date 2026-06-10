@@ -58,6 +58,10 @@ type config struct {
 	pairs       int
 	concurrency int
 
+	// kshortest flags
+	frontiers string
+	tol       float64
+
 	// uid-map cache
 	uidMapCache    string
 	refreshUIDMap  bool
@@ -65,7 +69,7 @@ type config struct {
 
 func main() {
 	cfg := config{}
-	flag.StringVar(&cfg.mode, "mode", "perf", "correctness | perf")
+	flag.StringVar(&cfg.mode, "mode", "perf", "correctness | perf | kshortest")
 	flag.StringVar(&cfg.datasetDir, "dataset", "", "path to extracted LDBC dataset")
 	flag.StringVar(&cfg.alpha, "alpha", "localhost:9080", "Dgraph alpha gRPC address")
 	flag.StringVar(&cfg.out, "out", "", "output JSON path (defaults to results/<mode>.json)")
@@ -79,6 +83,8 @@ func main() {
 	flag.IntVar(&cfg.concurrency, "concurrency", runtime.GOMAXPROCS(0), "worker count (applies to both correctness and perf modes)")
 	flag.StringVar(&cfg.uidMapCache, "uidmap-cache", "", "path to cached uid map TSV (defaults to <dataset>/dgraph/uid-map.tsv). Reused across PR-build swaps to skip the slow refetch.")
 	flag.BoolVar(&cfg.refreshUIDMap, "refresh-uidmap", false, "ignore the uid map cache and refetch from Dgraph (do this after a fresh bulk-load)")
+	flag.StringVar(&cfg.frontiers, "frontiers", "0,10000,5000,1000,500,200,100", "[kshortest] comma-separated maxfrontiersize sweep; 0 = unlimited")
+	flag.Float64Var(&cfg.tol, "tol", 0.0001, "[kshortest] relative tolerance for weight-vector comparison")
 	flag.Parse()
 
 	if cfg.datasetDir == "" {
@@ -140,6 +146,8 @@ func main() {
 		runCorrectness(ctx, cfg, c, ds, uidMap)
 	case "perf":
 		runPerf(ctx, cfg, c, uidMap)
+	case "kshortest":
+		runKShortest(ctx, cfg, c, ds, uidMap)
 	default:
 		log.Fatalf("unknown mode %q", cfg.mode)
 	}
