@@ -128,6 +128,26 @@ for branch in "${BRANCHES[@]}"; do
         stop_alpha; continue
     fi
 
+    # /health goes green BEFORE the bulk tablets are queryable (the alpha must
+    # load postings + register tablets with zero, slower against a fresh zero).
+    # So wait until the data is actually served — poll count(graphalytics_id)>0
+    # — otherwise the bench races ahead and fetches an empty uid map.
+    log "[$branch] waiting for bulk data to be served..."
+    data_ok=0
+    for _ in $(seq 1 90); do
+        n=$(curl -s -m 5 -H 'Content-Type: application/dql' "$ALPHA_HTTP_URL/query" \
+              -d '{ q(func: has(graphalytics_id)) { count(uid) } }' 2>/dev/null \
+              | jq -r '.data.q[0].count // 0' 2>/dev/null)
+        if [[ "${n:-0}" =~ ^[0-9]+$ ]] && (( n > 0 )); then
+            data_ok=1; log "[$branch] data served: $n nodes"; break
+        fi
+        sleep 2
+    done
+    if (( data_ok == 0 )); then
+        warn "[$branch] bulk data not served within 180s -- skipping branch"
+        stop_alpha; continue
+    fi
+
     refresh=""
     if (( first == 1 )); then refresh="-refresh-uidmap"; first=0; fi  # uids stable across branches
 
