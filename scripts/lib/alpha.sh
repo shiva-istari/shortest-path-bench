@@ -145,6 +145,17 @@ start_alpha() {
           > "$logfile" 2>&1 &
       echo $! > /tmp/dgraph-alpha.pid
     )
+    # Make alpha the OOM-killer's first victim. A runaway numpaths>=2 query can
+    # balloon memory; without this the kernel may kill the SSH session/sshd
+    # instead, which looks like "can't log into the VM". Raising our own
+    # process's oom_score_adj is allowed without root. So a runaway kills alpha
+    # (recoverable, logged as a query error) and leaves sshd alone.
+    local apid
+    apid=$(cat /tmp/dgraph-alpha.pid 2>/dev/null || true)
+    if [[ -n "$apid" ]]; then
+        echo "${ALPHA_OOM_SCORE_ADJ:-900}" > "/proc/$apid/oom_score_adj" 2>/dev/null \
+            || warn "could not set oom_score_adj for alpha pid $apid (continuing)"
+    fi
     RUNNING_ALPHA=1
 }
 
