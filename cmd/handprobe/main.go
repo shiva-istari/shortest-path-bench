@@ -58,6 +58,8 @@ _:n5 <connected> _:n4 (weight=10.0) .
 func main() {
 	alpha := flag.String("alpha", "localhost:9080", "Dgraph alpha gRPC address (point at a FRESH/empty alpha)")
 	numpaths := flag.Int("numpaths", 2, "numpaths for the probe query")
+	maxFrontier := flag.Int("maxfrontier", 0, "maxfrontiersize for the probe query (0 = unbounded)")
+	timeout := flag.Duration("timeout", 30*time.Second, "hard timeout on the shortest query so a hanging binary can't wedge the session")
 	flag.Parse()
 
 	ctx := context.Background()
@@ -84,19 +86,30 @@ func main() {
 	dst := lookupUID(ctx, dg, 4)
 	fmt.Printf("src(gid=1)=%s  dst(gid=4)=%s\n\n", src, dst)
 
+	frontier := ""
+	if *maxFrontier > 0 {
+		frontier = fmt.Sprintf(", maxfrontiersize: %d", *maxFrontier)
+	}
 	q := fmt.Sprintf(`
 	{
-		path as shortest(from: %s, to: %s, numpaths: %d) {
+		path as shortest(from: %s, to: %s, numpaths: %d%s) {
 			connected @facets(weight)
 		}
 		result(func: uid(path)) { uid graphalytics_id }
-	}`, src, dst, *numpaths)
+	}`, src, dst, *numpaths, frontier)
 
+	// Hard deadline: if the binary hangs on numpaths>=2, the client gives up
+	// instead of blocking forever (which, with an unbounded query, can balloon
+	// alpha's memory and get the SSH session OOM-killed).
+	qctx, cancel := context.WithTimeout(ctx, *timeout)
+	defer cancel()
 	rtxn := dg.NewReadOnlyTxn().BestEffort()
-	resp, err := rtxn.Query(ctx, q)
+	resp, err := rtxn.Query(qctx, q)
 	_ = rtxn.Discard(ctx)
 	if err != nil {
-		log.Fatalf("shortest query: %v", err)
+		log.Fatalf("shortest query (timeout=%s, maxfrontier=%d): %v\n"+
+			"  a timeout here means this binary does not terminate numpaths=%d on a 6-node graph — that is itself the finding.",
+			*timeout, *maxFrontier, err, *numpaths)
 	}
 
 	fmt.Println("=== RAW _path_ JSON (write the self-consistency parser against THIS) ===")
