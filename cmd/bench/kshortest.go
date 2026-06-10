@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math"
 	"math/rand"
 	"sort"
 	"strconv"
@@ -82,10 +83,12 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 	}
 	log.Printf("[kshortest] oracle graph: %d nodes in %s", g.Nodes(), time.Since(start).Round(time.Millisecond))
 
-	// Sample candidate targets and precompute oracle vectors. Keep only targets
-	// the oracle finds at least 2 loopless paths to — those are the ones a
-	// numpaths>=2 query can actually be wrong about.
-	candidates := sampleTargets(uidMap, source, cfg.targets, cfg.seed)
+	// Select candidate targets from a distance band, not uniformly at random.
+	// Uniform random picks targets thousands of hops away, where the numpaths=2
+	// frontier explodes (queries time out) and Yen precompute is slow. A
+	// near/moderate band keeps both fast while still exercising eviction — the
+	// regime where the bug lives.
+	candidates := bandedTargets(ds.SSSPRefFile, uidMap, source, cfg.bandLo, cfg.bandHi, cfg.targets, cfg.seed)
 	type pair struct {
 		gid    int64
 		uid    string
@@ -209,20 +212,63 @@ func parseFrontiers(s string) []int {
 	return out
 }
 
-// sampleTargets returns up to n vertex ids (other than source) present in the
-// uid map, deterministically for a given seed.
-func sampleTargets(uidMap map[int64]string, source int64, n int, seed int64) []int64 {
-	all := make([]int64, 0, len(uidMap))
-	for gid := range uidMap {
-		if gid != source {
-			all = append(all, gid)
+// bandedTargets selects up to n target vertices whose SSSP reference distance
+// falls in the percentile window [bandLo, bandHi] of the distance-sorted
+// reachable set. This avoids the far-target frontier explosion (which times out
+// queries and makes Yen precompute slow) while still hitting multi-hop targets
+// where eviction — and the bug — is exercised. Deterministic for a given seed.
+func bandedTargets(ssspFile string, uidMap map[int64]string, source int64, bandLo, bandHi float64, n int, seed int64) []int64 {
+	ref, err := ldbc.ReadSSSP(ssspFile)
+	if err != nil {
+		log.Fatalf("[kshortest] banded target selection needs the SSSP reference (%s): %v", ssspFile, err)
+	}
+	type td struct {
+		gid  int64
+		dist float64
+	}
+	reach := make([]td, 0, len(ref))
+	for gid, d := range ref {
+		if gid == source || d <= 0 || math.IsInf(d, +1) {
+			continue
+		}
+		if _, ok := uidMap[gid]; ok {
+			reach = append(reach, td{gid, d})
 		}
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i] < all[j] })
-	if n > 0 && n < len(all) {
-		rng := rand.New(rand.NewSource(seed))
-		rng.Shuffle(len(all), func(i, j int) { all[i], all[j] = all[j], all[i] })
-		all = all[:n]
+	if len(reach) == 0 {
+		log.Fatal("[kshortest] no reachable targets in SSSP reference")
 	}
-	return all
+	sort.Slice(reach, func(i, j int) bool {
+		if reach[i].dist != reach[j].dist {
+			return reach[i].dist < reach[j].dist
+		}
+		return reach[i].gid < reach[j].gid // stable tie-break for determinism
+	})
+
+	lo := int(bandLo * float64(len(reach)))
+	hi := int(bandHi * float64(len(reach)))
+	lo = max(lo, 0)
+	hi = min(hi, len(reach))
+	if lo >= hi { // degenerate band — fall back to a single rank
+		lo = min(lo, len(reach)-1)
+		hi = lo + 1
+	}
+	band := reach[lo:hi]
+	log.Printf("[kshortest] target band [%.4f,%.4f] = ranks %d..%d of %d reachable (dist %.0f..%.0f)",
+		bandLo, bandHi, lo, hi, len(reach), band[0].dist, band[len(band)-1].dist)
+
+	idx := make([]int, len(band))
+	for i := range idx {
+		idx[i] = i
+	}
+	rng := rand.New(rand.NewSource(seed))
+	rng.Shuffle(len(idx), func(i, j int) { idx[i], idx[j] = idx[j], idx[i] })
+	if n > 0 && n < len(idx) {
+		idx = idx[:n]
+	}
+	out := make([]int64, 0, len(idx))
+	for _, i := range idx {
+		out = append(out, band[i].gid)
+	}
+	return out
 }

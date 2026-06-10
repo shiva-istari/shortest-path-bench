@@ -61,6 +61,8 @@ type config struct {
 	// kshortest flags
 	frontiers string
 	tol       float64
+	bandLo    float64
+	bandHi    float64
 
 	// uid-map cache
 	uidMapCache    string
@@ -85,6 +87,8 @@ func main() {
 	flag.BoolVar(&cfg.refreshUIDMap, "refresh-uidmap", false, "ignore the uid map cache and refetch from Dgraph (do this after a fresh bulk-load)")
 	flag.StringVar(&cfg.frontiers, "frontiers", "0,10000,5000,1000,500,200,100", "[kshortest] comma-separated maxfrontiersize sweep; 0 = unlimited")
 	flag.Float64Var(&cfg.tol, "tol", 0.0001, "[kshortest] relative tolerance for weight-vector comparison")
+	flag.Float64Var(&cfg.bandLo, "band-lo", 0.0005, "[kshortest] low edge of the SSSP-distance band to draw targets from (fraction of distance-sorted reachable vertices)")
+	flag.Float64Var(&cfg.bandHi, "band-hi", 0.01, "[kshortest] high edge of the SSSP-distance band; far targets blow up the numpaths=2 frontier and time out, so keep this small")
 	flag.Parse()
 
 	if cfg.datasetDir == "" {
