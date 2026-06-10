@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/dgraph-io/dgo/v250 v250.0.0
+	gonum.org/v1/gonum v0.17.0
 	google.golang.org/grpc v1.80.0
 )
 

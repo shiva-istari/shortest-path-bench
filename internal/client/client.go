@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -154,9 +155,15 @@ type ShortestOptions struct {
 
 // ShortestResult is the parsed outcome of a shortest-path query.
 type ShortestResult struct {
-	// Distance is the total path weight (sum of edge facets). math.Inf if no
-	// path was returned.
+	// Distance is the smallest total path weight (the classic shortest
+	// distance). math.Inf if no path was returned. Kept for the SSSP top-1
+	// correctness mode.
 	Distance float64
+	// Weights is the per-path total weights from every entry in _path_, sorted
+	// non-decreasing. This is the weight VECTOR compared against the oracle's
+	// TopK output: comparing sorted costs (not path identity) is what makes the
+	// k-shortest correctness check robust to ties. Len == PathCount.
+	Weights []float64
 	// Latency is the wall time spent in the gRPC round-trip.
 	Latency time.Duration
 	// PathCount is the number of distinct paths in the response (1 for the
@@ -216,16 +223,22 @@ func (c *Client) Shortest(ctx context.Context, opts ShortestOptions) (ShortestRe
 		return ShortestResult{Latency: elapsed, Distance: math.Inf(+1), PathCount: 0}, nil
 	}
 
-	best := math.Inf(+1)
+	weights := make([]float64, 0, len(decoded.Paths))
 	for _, p := range decoded.Paths {
 		if raw, ok := p["_weight_"]; ok {
-			if f, ok := toFloat(raw); ok && f < best {
-				best = f
+			if f, ok := toFloat(raw); ok {
+				weights = append(weights, f)
 			}
 		}
 	}
+	sort.Float64s(weights)
+	best := math.Inf(+1)
+	if len(weights) > 0 {
+		best = weights[0]
+	}
 	return ShortestResult{
 		Distance:  best,
+		Weights:   weights,
 		Latency:   elapsed,
 		PathCount: len(decoded.Paths),
 	}, nil
