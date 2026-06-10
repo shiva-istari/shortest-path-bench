@@ -135,6 +135,11 @@ func main() {
 		}
 		log.Printf("[bench] uid map: %d entries in %s", len(m), time.Since(start).Round(time.Millisecond))
 		uidMap = m
+		// Never cache an empty map: a transient "alpha serving no data" would
+		// otherwise poison the cache and make every subsequent branch fail.
+		if len(uidMap) == 0 {
+			log.Fatal("uid map empty — alpha has no graphalytics_id nodes (cluster not serving the bulk p/?). NOT caching the empty result; fix the cluster and retry.")
+		}
 		if err := os.MkdirAll(filepath.Dir(cfg.uidMapCache), 0o755); err == nil {
 			if serr := client.SaveUIDMap(cfg.uidMapCache, uidMap); serr != nil {
 				log.Printf("[bench] warning: failed to save uid map cache to %s: %v", cfg.uidMapCache, serr)
