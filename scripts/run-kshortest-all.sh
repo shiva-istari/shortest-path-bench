@@ -44,12 +44,12 @@ read -ra BRANCHES <<< "$BRANCHES_STR"
 DATASET="${DATASET_OVERRIDE:-roadCOL}"
 
 NUMPATHS="${NUMPATHS:-2}"
-TARGETS="${TARGETS:-30}"
+TARGETS="${TARGETS:-100}"          # more targets -> resolves small main-vs-PR differences
 FRONTIERS="${FRONTIERS:-0,10000,1000,100}"
 BANDLO="${BANDLO:-0.0005}"
 BANDHI="${BANDHI:-0.004}"
 TOL="${TOL:-0.0001}"
-TIMEOUT="${TIMEOUT:-30s}"
+TIMEOUT="${TIMEOUT:-60s}"          # higher -> fewer timeouts polluting the unlimited row
 SEED="${SEED:-1}"
 
 ALPHA_HTTP_URL="${ALPHA_HTTP_URL:-http://localhost:8080}"
@@ -107,6 +107,19 @@ for branch in "${BRANCHES[@]}"; do
         continue
     fi
 
+    # VERIFY the running binary is actually this branch's commit, before we
+    # trust any numbers from it. Catches a stale PATH or a failed make install.
+    want_sha=$(cd "$DGRAPH_REPO" && git rev-parse --short=9 "$branch" 2>/dev/null)
+    bin_sha=$(dgraph version 2>/dev/null | awk -F: '/Commit SHA-1/{gsub(/[[:space:]]/,"",$2); print $2}')
+    log "[$branch] want commit=$want_sha  binary reports commit=$bin_sha"
+    if [[ -z "$bin_sha" ]]; then
+        die "[$branch] could not parse 'Commit SHA-1' from dgraph version -- cannot verify binary"
+    fi
+    if [[ "$bin_sha" != "$want_sha"* && "$want_sha" != "$bin_sha"* ]]; then
+        die "[$branch] BINARY MISMATCH: branch commit=$want_sha but running binary=$bin_sha (PATH/build problem)"
+    fi
+    label="${branch}@${bin_sha}"
+
     stop_alpha
     reset_data "$BP"
     start_alpha "$LOG_DIR/alpha-kshortest-$branch.log"
@@ -118,8 +131,19 @@ for branch in "${BRANCHES[@]}"; do
     refresh=""
     if (( first == 1 )); then refresh="-refresh-uidmap"; first=0; fi  # uids stable across branches
 
+    # Capture proof that the eviction path is actually exercised: a CPU profile
+    # + goroutine dump, taken ~40s into the run (during the frontier sweep). On
+    # a binary that's evicting under maxfrontiersize, `go tool pprof -top` on the
+    # CPU profile shows (*priorityQueue).removeMax / pq.Pop / expandOut.
+    if [[ "${CAPTURE_PPROF:-1}" == "1" ]]; then
+        ( sleep 40
+          curl -s "${ALPHA_HTTP_URL}/debug/pprof/profile?seconds=30" -o "$KS_DIR/pprof-cpu-$branch.prof" 2>/dev/null
+          curl -s "${ALPHA_HTTP_URL}/debug/pprof/goroutine?debug=2"  -o "$KS_DIR/pprof-goroutine-$branch.txt" 2>/dev/null ) &
+        pprof_pid=$!
+    fi
+
     out="$KS_DIR/${branch}-${DATASET}.json"
-    log "[$branch] kshortest -> $out"
+    log "[$branch] kshortest ($label) -> $out"
     if ! ( cd "$BENCH_DIR" && go run ./cmd/bench \
               -mode kshortest \
               -dataset "$ds_dir" \
@@ -129,30 +153,39 @@ for branch in "${BRANCHES[@]}"; do
               -frontiers "$FRONTIERS" \
               -band-lo "$BANDLO" -band-hi "$BANDHI" \
               -tol "$TOL" -timeout "$TIMEOUT" -seed "$SEED" \
+              -label "$label" \
               $refresh \
               -out "$out" \
          ) 2>&1 | tee "$LOG_DIR/bench-kshortest-$branch.log"; then
         warn "[$branch] bench invocation failed -- see log"
     fi
+    [[ -n "${pprof_pid:-}" ]] && wait "$pprof_pid" 2>/dev/null || true
     stop_alpha
 done
 
 # ---- cross-branch summary --------------------------------------------------
+# Report correct-of-RETURNED (timeouts excluded from the denominator) as
+# "c/r=NN%(rN tT)": NN% correct of returned, r returned, t timed out. A timeout
+# is not a wrong answer, so folding it into correctness would understate a
+# branch that simply ran slow.
 log ""
-log "================= SUMMARY (correct% by frontier) ================="
-printf '%-14s' "frontier"; for b in "${BRANCHES[@]}"; do printf ' %-12s' "$b"; done; echo
+log "================= SUMMARY: correct-of-returned% (returned / timeouts) ================="
+printf '%-12s' "frontier"; for b in "${BRANCHES[@]}"; do printf ' %-22s' "$b"; done; echo
 for fr in ${FRONTIERS//,/ }; do
-    label=$fr; [[ "$fr" == "0" ]] && label="unlimited"
-    printf '%-14s' "$label"
+    flabel=$fr; [[ "$fr" == "0" ]] && flabel="unlimited"
+    printf '%-12s' "$flabel"
     for b in "${BRANCHES[@]}"; do
         f="$KS_DIR/${b}-${DATASET}.json"
         if [[ -f "$f" ]]; then
-            pct=$(jq -r --argjson fr "$fr" '.frontiers[]? | select(.max_frontier==$fr) | .correct_pct' "$f" 2>/dev/null)
-            printf ' %-12s' "${pct:-NA}"
+            cell=$(jq -r --argjson fr "$fr" '.frontiers[]? | select(.max_frontier==$fr)
+                | "\(.correct_of_returned_pct|floor)%(r\(.returned) t\(.timeouts))"' "$f" 2>/dev/null)
+            printf ' %-22s' "${cell:-NA}"
         else
-            printf ' %-12s' "norun"
+            printf ' %-22s' "norun"
         fi
     done
     echo
 done
-log "results: $KS_DIR   master log: $MASTER_LOG"
+log "results: $KS_DIR (per-branch JSONs carry full per-target detail)"
+log "pprof:   $KS_DIR/pprof-cpu-<branch>.prof  -> verify eviction with: go tool pprof -top <file> | grep -iE 'removeMax|pq.Pop|expandOut'"
+log "master log: $MASTER_LOG"

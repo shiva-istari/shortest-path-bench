@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
 	"math"
 	"math/rand"
@@ -23,33 +24,72 @@ import (
 // (not path identity) is tie-robust; the oracle is validated (internal/oracle
 // tests) and the loopless-not-disjoint semantics confirmed (cmd/handprobe).
 //
-// Per (target, frontier) it records: verdict (ok / count_mismatch /
-// weight_mismatch), Dgraph's self-consistency (summed facets == reported
-// _weight_, loopless), and latency. The per-frontier table shows exactly where
-// each binary starts dropping or corrupting paths.
+// The output JSON keeps full per-target detail (oracle vs Dgraph vectors,
+// verdict, latency, self-consistency, the SSSP distance) so any aggregate can
+// be re-derived and any individual failure audited later. It also splits
+// timeouts out of the correctness denominator: a query that never returned is
+// NOT "wrong", so we report correct/returned separately from correct/targets.
 //
 // Run once per PR binary against its alpha; aggregate the JSONs across PRs.
 
+// kTarget is the full record of one (target, frontier) comparison.
+type kTarget struct {
+	GID            int64     `json:"gid"`
+	SSSPDist       float64   `json:"sssp_dist"`
+	DstUID         string    `json:"dst_uid"`
+	OracleWeights  []float64 `json:"oracle_weights"`
+	DgraphWeights  []float64 `json:"dgraph_weights"`
+	PathCount      int       `json:"path_count"`
+	Verdict        string    `json:"verdict"` // ok|count_mismatch|weight_mismatch|timeout|error
+	WorstRelErr    float64   `json:"worst_rel_err"`
+	SelfConsistent bool      `json:"self_consistent"`
+	Loopless       bool      `json:"loopless"`
+	MaxWeightErr   float64   `json:"max_weight_err"`
+	LatencyMS      float64   `json:"latency_ms"`
+	Err            string    `json:"err,omitempty"`
+}
+
 type kFrontierStat struct {
-	MaxFrontier      int           `json:"max_frontier"` // 0 = unlimited
-	Targets          int           `json:"targets"`
-	Correct          int           `json:"correct"`
-	CorrectPct       float64       `json:"correct_pct"`
-	CountMismatch    int           `json:"count_mismatch"`
-	WeightMismatch   int           `json:"weight_mismatch"`
-	SelfInconsistent int           `json:"self_inconsistent"`
-	Errors           int           `json:"errors"`
-	Latency          stats.Summary `json:"latency"`
+	MaxFrontier int `json:"max_frontier"` // 0 = unlimited
+	Targets     int `json:"targets"`
+	Returned    int `json:"returned"` // queries that came back (not timeout/other error)
+	Correct     int `json:"correct"`
+	// CorrectPct is correct/targets (timeouts counted as failures — pessimistic).
+	CorrectPct float64 `json:"correct_pct"`
+	// CorrectOfReturnedPct is correct/returned — the honest correctness among
+	// queries that actually finished. This is the number to compare across PRs.
+	CorrectOfReturnedPct float64       `json:"correct_of_returned_pct"`
+	CountMismatch        int           `json:"count_mismatch"`
+	WeightMismatch       int           `json:"weight_mismatch"`
+	SelfInconsistent     int           `json:"self_inconsistent"`
+	Timeouts             int           `json:"timeouts"`
+	OtherErrors          int           `json:"other_errors"`
+	Latency              stats.Summary `json:"latency"`
+	TargetResults        []kTarget     `json:"target_results"`
 }
 
 type kResult struct {
+	Label            string          `json:"label"` // e.g. "pr-9599@997d5dcb"
 	Dataset          string          `json:"dataset"`
 	Source           int64           `json:"source_vertex"`
 	NumPaths         int             `json:"num_paths"`
+	EdgePred         string          `json:"edge_pred"`
+	MaxFrontierSweep []int           `json:"max_frontier_sweep"`
 	Tolerance        float64         `json:"tolerance"`
+	Seed             int64           `json:"seed"`
+	BandLo           float64         `json:"band_lo"`
+	BandHi           float64         `json:"band_hi"`
+	GraphNodes       int             `json:"graph_nodes"`
+	Directed         bool            `json:"directed"`
 	CandidateTargets int             `json:"candidate_targets"`
 	QualifiedTargets int             `json:"qualified_targets"`
+	StartedUTC       string          `json:"started_utc"`
 	Frontiers        []kFrontierStat `json:"frontiers"`
+}
+
+type kCand struct {
+	gid  int64
+	dist float64
 }
 
 func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Dataset, uidMap map[int64]string) {
@@ -91,18 +131,19 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 	candidates := bandedTargets(ds.SSSPRefFile, uidMap, source, cfg.bandLo, cfg.bandHi, cfg.targets, cfg.seed)
 	type pair struct {
 		gid    int64
+		dist   float64
 		uid    string
 		oracle []float64
 	}
 	var qualified []pair
 	log.Printf("[kshortest] precomputing oracle top-%d for %d candidate targets...", numPaths, len(candidates))
 	preStart := time.Now()
-	for i, tgt := range candidates {
-		vec, err := g.TopK(source, tgt, numPaths)
+	for i, cand := range candidates {
+		vec, err := g.TopK(source, cand.gid, numPaths)
 		if err != nil || len(vec) < 2 {
 			continue
 		}
-		qualified = append(qualified, pair{gid: tgt, uid: uidMap[tgt], oracle: vec})
+		qualified = append(qualified, pair{gid: cand.gid, dist: cand.dist, uid: uidMap[cand.gid], oracle: vec})
 		if (i+1)%50 == 0 {
 			log.Printf("[kshortest] oracle precompute %d/%d (%d qualified) elapsed=%s",
 				i+1, len(candidates), len(qualified), time.Since(preStart).Round(time.Second))
@@ -115,12 +156,21 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 		len(qualified), len(candidates), time.Since(preStart).Round(time.Second))
 
 	res := kResult{
+		Label:            cfg.label,
 		Dataset:          ds.Name,
 		Source:           source,
 		NumPaths:         numPaths,
+		EdgePred:         cfg.edgePred,
+		MaxFrontierSweep: frontiers,
 		Tolerance:        cfg.tol,
+		Seed:             cfg.seed,
+		BandLo:           cfg.bandLo,
+		BandHi:           cfg.bandHi,
+		GraphNodes:       g.Nodes(),
+		Directed:         directed,
 		CandidateTargets: len(candidates),
 		QualifiedTargets: len(qualified),
+		StartedUTC:       time.Now().UTC().Format(time.RFC3339),
 	}
 
 	srcUID := uidMap[source]
@@ -139,33 +189,60 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 				MaxFrontier: fr,
 				Timeout:     cfg.timeout,
 			})
+			tr := kTarget{
+				GID: p.gid, SSSPDist: p.dist, DstUID: p.uid,
+				OracleWeights: p.oracle,
+				LatencyMS:     float64(sr.Latency.Microseconds()) / 1000.0,
+			}
 			if err != nil {
 				rec.RecordError()
-				stat.Errors++
+				kind := classifyErr(err)
+				tr.Verdict = kind
+				tr.Err = err.Error()
+				if kind == "timeout" {
+					stat.Timeouts++
+				} else {
+					stat.OtherErrors++
+				}
+				stat.TargetResults = append(stat.TargetResults, tr)
 				continue
 			}
 			rec.Record(sr.Latency)
+			stat.Returned++
+			tr.DgraphWeights = sr.Weights
+			tr.PathCount = sr.PathCount
+			tr.SelfConsistent = sr.SelfConsistent
+			tr.Loopless = sr.Loopless
+			tr.MaxWeightErr = sr.MaxWeightErr
 			if !sr.SelfConsistent || !sr.Loopless {
 				stat.SelfInconsistent++
 			}
 			r := compare.Vectors(p.oracle, sr.Weights, cfg.tol)
+			tr.WorstRelErr = r.WorstRelErr
 			switch r.Verdict {
 			case compare.OK:
 				stat.Correct++
+				tr.Verdict = "ok"
 			case compare.CountMismatch:
 				stat.CountMismatch++
+				tr.Verdict = "count_mismatch"
 			case compare.WeightMismatch:
 				stat.WeightMismatch++
+				tr.Verdict = "weight_mismatch"
 			}
+			stat.TargetResults = append(stat.TargetResults, tr)
 		}
 		stat.Latency = rec.Summarize(time.Since(swStart))
 		if stat.Targets > 0 {
 			stat.CorrectPct = 100 * float64(stat.Correct) / float64(stat.Targets)
 		}
+		if stat.Returned > 0 {
+			stat.CorrectOfReturnedPct = 100 * float64(stat.Correct) / float64(stat.Returned)
+		}
 		res.Frontiers = append(res.Frontiers, stat)
-		log.Printf("[kshortest] frontier=%-7s correct=%d/%d (%.1f%%) cnt_mm=%d wt_mm=%d self_bad=%d err=%d p50=%s p95=%s",
-			frontierLabel(fr), stat.Correct, stat.Targets, stat.CorrectPct,
-			stat.CountMismatch, stat.WeightMismatch, stat.SelfInconsistent, stat.Errors,
+		log.Printf("[kshortest] frontier=%-9s correct=%d/%d returned=%d (%.1f%% of returned) wt_mm=%d cnt_mm=%d self_bad=%d timeout=%d err=%d p50=%s p95=%s",
+			frontierLabel(fr), stat.Correct, stat.Targets, stat.Returned, stat.CorrectOfReturnedPct,
+			stat.WeightMismatch, stat.CountMismatch, stat.SelfInconsistent, stat.Timeouts, stat.OtherErrors,
 			stat.Latency.P50.Round(time.Millisecond), stat.Latency.P95.Round(time.Millisecond))
 	}
 
@@ -173,16 +250,33 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 	printKTable(res)
 }
 
+// classifyErr distinguishes a query timeout (the binary didn't terminate within
+// the deadline) from any other error. A timeout is NOT a wrong answer, so it's
+// reported separately rather than folded into the correctness denominator.
+func classifyErr(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "timeout"
+	}
+	s := strings.ToLower(err.Error())
+	if strings.Contains(s, "deadline") || strings.Contains(s, "timeout") {
+		return "timeout"
+	}
+	return "error"
+}
+
 func printKTable(res kResult) {
-	log.Printf("[kshortest] === %s  source=%d  numpaths=%d  tol=%g  qualified=%d ===",
-		res.Dataset, res.Source, res.NumPaths, res.Tolerance, res.QualifiedTargets)
-	log.Printf("[kshortest] %-9s | %-8s | %-6s | %-6s | %-8s | %-4s | %-8s | %-8s",
-		"frontier", "correct%", "cnt_mm", "wt_mm", "self_bad", "err", "p50", "p95")
+	log.Printf("[kshortest] === %s  %s  source=%d  numpaths=%d  tol=%g  qualified=%d ===",
+		res.Label, res.Dataset, res.Source, res.NumPaths, res.Tolerance, res.QualifiedTargets)
+	log.Printf("[kshortest] %-9s | %-12s | %-8s | %-6s | %-6s | %-8s | %-8s | %-7s | %-8s",
+		"frontier", "correct/ret", "ret%", "wt_mm", "cnt_mm", "self_bad", "timeout", "err", "p95")
 	for _, s := range res.Frontiers {
-		log.Printf("[kshortest] %-9s | %7.1f%% | %-6d | %-6d | %-8d | %-4d | %-8s | %-8s",
-			frontierLabel(s.MaxFrontier), s.CorrectPct, s.CountMismatch, s.WeightMismatch,
-			s.SelfInconsistent, s.Errors,
-			s.Latency.P50.Round(time.Millisecond), s.Latency.P95.Round(time.Millisecond))
+		log.Printf("[kshortest] %-9s | %4d/%-7d | %7.1f%% | %-6d | %-6d | %-8d | %-8d | %-7d | %-8s",
+			frontierLabel(s.MaxFrontier), s.Correct, s.Returned, s.CorrectOfReturnedPct,
+			s.WeightMismatch, s.CountMismatch, s.SelfInconsistent, s.Timeouts, s.OtherErrors,
+			s.Latency.P95.Round(time.Millisecond))
 	}
 }
 
@@ -217,22 +311,18 @@ func parseFrontiers(s string) []int {
 // reachable set. This avoids the far-target frontier explosion (which times out
 // queries and makes Yen precompute slow) while still hitting multi-hop targets
 // where eviction — and the bug — is exercised. Deterministic for a given seed.
-func bandedTargets(ssspFile string, uidMap map[int64]string, source int64, bandLo, bandHi float64, n int, seed int64) []int64 {
+func bandedTargets(ssspFile string, uidMap map[int64]string, source int64, bandLo, bandHi float64, n int, seed int64) []kCand {
 	ref, err := ldbc.ReadSSSP(ssspFile)
 	if err != nil {
 		log.Fatalf("[kshortest] banded target selection needs the SSSP reference (%s): %v", ssspFile, err)
 	}
-	type td struct {
-		gid  int64
-		dist float64
-	}
-	reach := make([]td, 0, len(ref))
+	reach := make([]kCand, 0, len(ref))
 	for gid, d := range ref {
 		if gid == source || d <= 0 || math.IsInf(d, +1) {
 			continue
 		}
 		if _, ok := uidMap[gid]; ok {
-			reach = append(reach, td{gid, d})
+			reach = append(reach, kCand{gid, d})
 		}
 	}
 	if len(reach) == 0 {
@@ -266,9 +356,9 @@ func bandedTargets(ssspFile string, uidMap map[int64]string, source int64, bandL
 	if n > 0 && n < len(idx) {
 		idx = idx[:n]
 	}
-	out := make([]int64, 0, len(idx))
+	out := make([]kCand, 0, len(idx))
 	for _, i := range idx {
-		out = append(out, band[i].gid)
+		out = append(out, band[i])
 	}
 	return out
 }

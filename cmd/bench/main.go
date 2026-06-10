@@ -63,6 +63,7 @@ type config struct {
 	tol       float64
 	bandLo    float64
 	bandHi    float64
+	label     string
 
 	// uid-map cache
 	uidMapCache    string
@@ -89,6 +90,7 @@ func main() {
 	flag.Float64Var(&cfg.tol, "tol", 0.0001, "[kshortest] relative tolerance for weight-vector comparison")
 	flag.Float64Var(&cfg.bandLo, "band-lo", 0.0005, "[kshortest] low edge of the SSSP-distance band to draw targets from (fraction of distance-sorted reachable vertices)")
 	flag.Float64Var(&cfg.bandHi, "band-hi", 0.01, "[kshortest] high edge of the SSSP-distance band; far targets blow up the numpaths=2 frontier and time out, so keep this small")
+	flag.StringVar(&cfg.label, "label", "", "[kshortest] free-form label embedded in the result JSON (e.g. branch@sha) so each file is self-identifying")
 	flag.Parse()
 
 	if cfg.datasetDir == "" {
