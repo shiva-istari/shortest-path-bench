@@ -180,7 +180,7 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 		stat := kFrontierStat{MaxFrontier: fr, Targets: len(qualified)}
 		rec := stats.New()
 		swStart := time.Now()
-		for _, p := range qualified {
+		for i, p := range qualified {
 			sr, err := c.Shortest(ctx, client.ShortestOptions{
 				SrcUID:      srcUID,
 				DstUID:      p.uid,
@@ -231,6 +231,13 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 				tr.Verdict = "weight_mismatch"
 			}
 			stat.TargetResults = append(stat.TargetResults, tr)
+			// Heartbeat inside a frontier: a 100-target phase with 60s timeouts
+			// can run quiet for 15+ min otherwise, which looks like a hang.
+			if (i+1)%25 == 0 {
+				log.Printf("[kshortest]   frontier=%s progress %d/%d (correct=%d wt_mm=%d cnt_mm=%d self_bad=%d timeout=%d)",
+					frontierLabel(fr), i+1, len(qualified), stat.Correct, stat.WeightMismatch,
+					stat.CountMismatch, stat.SelfInconsistent, stat.Timeouts)
+			}
 		}
 		stat.Latency = rec.Summarize(time.Since(swStart))
 		if stat.Targets > 0 {
@@ -244,9 +251,11 @@ func runKShortest(ctx context.Context, cfg config, c *client.Client, ds *ldbc.Da
 			frontierLabel(fr), stat.Correct, stat.Targets, stat.Returned, stat.CorrectOfReturnedPct,
 			stat.WeightMismatch, stat.CountMismatch, stat.SelfInconsistent, stat.Timeouts, stat.OtherErrors,
 			stat.Latency.P50.Round(time.Millisecond), stat.Latency.P95.Round(time.Millisecond))
+		// Persist after EACH frontier so a kill/drop mid-branch keeps the
+		// frontiers done so far, instead of losing the whole branch.
+		writeJSON(cfg.out, res)
 	}
 
-	writeJSON(cfg.out, res)
 	printKTable(res)
 }
 

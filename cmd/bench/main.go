@@ -22,7 +22,6 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -479,16 +478,25 @@ func runPerf(ctx context.Context, cfg config, c *client.Client, uidMap map[int64
 		res.HeapMaxMB, res.Latency.Errors)
 }
 
+// writeJSON writes v atomically: encode to <path>.tmp, then rename over <path>.
+// Atomicity matters because kshortest now writes after every frontier — a kill
+// mid-encode must not corrupt or truncate the last-good result.
 func writeJSON(path string, v any) {
-	f, err := os.Create(path)
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
 	if err != nil {
-		log.Fatalf("create %s: %v", path, err)
+		log.Fatalf("create %s: %v", tmp, err)
 	}
-	defer f.Close()
 	enc := json.NewEncoder(f)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(v); err != nil {
-		log.Fatalf("encode %s: %v", path, err)
+		f.Close()
+		log.Fatalf("encode %s: %v", tmp, err)
 	}
-	fmt.Println("wrote", path)
+	if err := f.Close(); err != nil {
+		log.Fatalf("close %s: %v", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		log.Fatalf("rename %s -> %s: %v", tmp, path, err)
+	}
 }
