@@ -31,9 +31,14 @@ RESULTS_DIR="${RESULTS_DIR:-/srv/results-run2}"
 DATASET="${DATASET_OVERRIDE:-roadCOL}"
 ZERO_DIR="${ZERO_DIR:-/srv/db/zero-setup}"
 # 48G cap leaves 16G of the 64G VM for the OS, sshd, zero, and the Go bench
-# client; 32G swap cap matches the swapfile provisioned per the RCA.
+# client. MemorySwapMax MUST stay near zero: with a large value (32G), hitting
+# MemoryMax never OOM-kills -- the kernel "successfully" reclaims by churning
+# pages through swap on the slow boot disk and the VM freezes in an I/O death
+# spiral (observed 2026-06-12, run 20260612-082535: alpha RSS pinned at 48G,
+# swap 32G/32G full, CPU 350%, VM frozen). With ~1G the cgroup runs out of
+# reclaim room immediately and alpha is killed cleanly instead.
 MEMORY_MAX="${MEMORY_MAX:-48G}"
-MEMORY_SWAP_MAX="${MEMORY_SWAP_MAX:-32G}"
+MEMORY_SWAP_MAX="${MEMORY_SWAP_MAX:-1G}"
 
 # Single systemd-availability check, used by both the zero unit (step 2) and
 # the capped bench unit (step 3).
