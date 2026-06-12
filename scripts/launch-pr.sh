@@ -16,9 +16,13 @@
 #
 #   ./scripts/launch-pr.sh pr-9599
 #
-# Watch:   tail -f results/sweep-<pr>.out      (or: journalctl -u dgraph-bench-<pr> -f)
-# Status:  jq '.frontiers|length' /srv/results-run2/kshortest/<pr>-roadCOL.json
-#          (4 = all frontiers done)
+# Every run is tagged with a timestamp (RUN_TAG): output files are never
+# overwritten across launches. results/sweep-<pr>-latest.out always points at
+# the newest run.
+#
+# Watch:   tail -f results/sweep-<pr>-latest.out  (or: journalctl -u dgraph-bench-<pr> -f)
+# Status:  jq '.frontiers|length' /srv/results-run2/kshortest/<pr>-roadCOL-<run_tag>.json
+#          (4 = all frontiers done; exact path printed at launch)
 set -euo pipefail
 
 PR="${1:?usage: launch-pr.sh <branch, e.g. pr-9599>}"
@@ -117,11 +121,16 @@ else
     echo "[launch] zero up"
 fi
 
-# 3. launch detached -- memory-capped systemd transient unit, nohup fallback
+# 3. launch detached -- memory-capped systemd transient unit, nohup fallback.
+#    RUN_TAG suffixes every artifact of this run (.out, JSONs, logs, pprof) so
+#    a re-launch NEVER overwrites a previous run; sweep-$PR-latest.out is a
+#    convenience symlink to the newest run's output.
 cd "$BENCH_DIR"
 mkdir -p results
-OUT="$BENCH_DIR/results/sweep-$PR.out"
+RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+OUT="$BENCH_DIR/results/sweep-$PR-$RUN_TAG.out"
 : > "$OUT"
+ln -sfn "$OUT" "$BENCH_DIR/results/sweep-$PR-latest.out"
 
 if (( HAVE_SYSTEMD )); then
     UNIT="dgraph-bench-$PR"
@@ -138,6 +147,7 @@ if (( HAVE_SYSTEMD )); then
         -p "Environment=RESULTS_DIR=$RESULTS_DIR" \
         -p "Environment=DATASET_OVERRIDE=$DATASET" \
         -p "Environment=BRANCHES_OVERRIDE=$PR" \
+        -p "Environment=RUN_TAG=$RUN_TAG" \
         "$BENCH_DIR/scripts/run-kshortest-all.sh"
     echo "[launch] $PR started as unit $UNIT (MemoryMax=$MEMORY_MAX MemorySwapMax=$MEMORY_SWAP_MAX)"
     echo "[launch] unit:    systemctl status $UNIT  |  journalctl -u $UNIT -f"
@@ -145,10 +155,13 @@ else
     echo "[launch] WARN: systemd-run/sudo unavailable -- falling back to nohup (NO memory cap;" >&2
     echo "[launch] WARN: a runaway query can exhaust RAM -- see dgraph-bench-rca)" >&2
     nohup env RESULTS_DIR="$RESULTS_DIR" DATASET_OVERRIDE="$DATASET" BRANCHES_OVERRIDE="$PR" \
+        RUN_TAG="$RUN_TAG" \
         ./scripts/run-kshortest-all.sh > "$OUT" 2>&1 &
     disown
     echo "[launch] $PR started (pid $!)"
 fi
+echo "[launch] run tag: $RUN_TAG"
 echo "[launch] watch:   tail -f $OUT"
-echo "[launch] memlog:  ls -t $RESULTS_DIR/logs/memlog-*.log | head -1"
-echo "[launch] status:  jq '.frontiers|length' $RESULTS_DIR/kshortest/$PR-$DATASET.json"
+echo "[launch]          (or: tail -f $BENCH_DIR/results/sweep-$PR-latest.out)"
+echo "[launch] memlog:  $RESULTS_DIR/logs/memlog-$RUN_TAG.log"
+echo "[launch] status:  jq '.frontiers|length' $RESULTS_DIR/kshortest/$PR-$DATASET-$RUN_TAG.json"

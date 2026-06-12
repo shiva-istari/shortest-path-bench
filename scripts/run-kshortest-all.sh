@@ -4,7 +4,9 @@
 # Sibling of run-pr-comparison.sh, but runs `cmd/bench -mode kshortest`: for
 # each branch it compares Dgraph's top-k path-cost VECTOR against the gonum Yen
 # oracle across a maxfrontiersize sweep, emitting a per-frontier correctness
-# table. One JSON per branch in $RESULTS_DIR/kshortest/<branch>-<dataset>.json.
+# table. One JSON per branch per run in
+# $RESULTS_DIR/kshortest/<branch>-<dataset>-<run_tag>.json -- a re-run never
+# overwrites a previous run's results.
 #
 # Per branch (once): git checkout + make install in $DGRAPH_REPO.
 # Per branch run:
@@ -31,6 +33,7 @@
 #   DATASET_OVERRIDE=roadCOL
 #   NUMPATHS=2  TARGETS=30  FRONTIERS="100,1000,10000,0"
 #   BANDLO=0.0005  BANDHI=0.004  TOL=0.0001  TIMEOUT=30s  SEED=1
+#   RUN_TAG=<ts>  -- suffix for all output files (default: launch timestamp)
 
 set -euo pipefail
 
@@ -56,6 +59,12 @@ BANDHI="${BANDHI:-0.004}"
 TOL="${TOL:-0.0001}"
 TIMEOUT="${TIMEOUT:-60s}"          # higher -> fewer timeouts polluting the unlimited row
 SEED="${SEED:-1}"
+
+# Every run writes to NEW files -- never overwrite a previous run's results,
+# logs, or pprof evidence. launch-pr.sh passes its own RUN_TAG so the .out
+# file and the per-branch artifacts share one tag; direct invocations get a
+# fresh timestamp.
+RUN_TAG="${RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 
 ALPHA_HTTP_URL="${ALPHA_HTTP_URL:-http://localhost:8080}"
 ALPHA_HEALTH_URL="$ALPHA_HTTP_URL/health"
@@ -98,9 +107,10 @@ require_zero
 log "config: dataset=$DATASET branches='${BRANCHES[*]}' numpaths=$NUMPATHS targets=$TARGETS"
 log "        frontiers=$FRONTIERS band=[$BANDLO,$BANDHI] timeout=$TIMEOUT bulk_p=$BP ($(size_of "$BP"))"
 
-MASTER_LOG="$LOG_DIR/kshortest-$(date +%Y%m%d-%H%M%S).log"
+MASTER_LOG="$LOG_DIR/kshortest-$RUN_TAG.log"
 exec > >(tee -a "$MASTER_LOG") 2>&1
-start_memlog "$LOG_DIR/memlog-$(date +%Y%m%d-%H%M%S).log"   # post-mortem RAM/RSS trace
+log "run tag: $RUN_TAG (all artifacts of this run carry this suffix)"
+start_memlog "$LOG_DIR/memlog-$RUN_TAG.log"   # post-mortem RAM/RSS trace
 stop_alpha
 
 # ---- sweep -----------------------------------------------------------------
@@ -109,8 +119,8 @@ for branch in "${BRANCHES[@]}"; do
     log ""
     log "================= BRANCH: $branch ================="
     if ! ( cd "$DGRAPH_REPO"; git checkout "$branch" >/dev/null 2>&1; make install ) \
-            2>&1 | tee "$LOG_DIR/build-$branch.log"; then
-        warn "[$branch] BUILD FAILED -- skipping (see $LOG_DIR/build-$branch.log)"
+            2>&1 | tee "$LOG_DIR/build-$branch-$RUN_TAG.log"; then
+        warn "[$branch] BUILD FAILED -- skipping (see $LOG_DIR/build-$branch-$RUN_TAG.log)"
         continue
     fi
 
@@ -127,12 +137,13 @@ for branch in "${BRANCHES[@]}"; do
     fi
     label="${branch}@${bin_sha}"
 
+    alpha_log="$LOG_DIR/alpha-kshortest-$branch-$RUN_TAG.log"
     stop_alpha
     reset_data "$BP"
-    start_alpha "$LOG_DIR/alpha-kshortest-$branch.log"
+    start_alpha "$alpha_log"
     if ! wait_alpha; then
         warn "[$branch] alpha unhealthy in ${ALPHA_HEALTH_TIMEOUT_SEC}s -- skipping"
-        tail_log "[$branch] alpha" "$LOG_DIR/alpha-kshortest-$branch.log"
+        tail_log "[$branch] alpha" "$alpha_log"
         stop_alpha; continue
     fi
 
@@ -165,12 +176,12 @@ for branch in "${BRANCHES[@]}"; do
     # CPU profile shows (*priorityQueue).removeMax / pq.Pop / expandOut.
     if [[ "${CAPTURE_PPROF:-1}" == "1" ]]; then
         ( sleep 40
-          curl -s "${ALPHA_HTTP_URL}/debug/pprof/profile?seconds=30" -o "$KS_DIR/pprof-cpu-$branch.prof" 2>/dev/null
-          curl -s "${ALPHA_HTTP_URL}/debug/pprof/goroutine?debug=2"  -o "$KS_DIR/pprof-goroutine-$branch.txt" 2>/dev/null ) &
+          curl -s "${ALPHA_HTTP_URL}/debug/pprof/profile?seconds=30" -o "$KS_DIR/pprof-cpu-$branch-$RUN_TAG.prof" 2>/dev/null
+          curl -s "${ALPHA_HTTP_URL}/debug/pprof/goroutine?debug=2"  -o "$KS_DIR/pprof-goroutine-$branch-$RUN_TAG.txt" 2>/dev/null ) &
         pprof_pid=$!
     fi
 
-    out="$KS_DIR/${branch}-${DATASET}.json"
+    out="$KS_DIR/${branch}-${DATASET}-${RUN_TAG}.json"
     log "[$branch] kshortest ($label) -> $out"
     if ! ( cd "$BENCH_DIR" && go run ./cmd/bench \
               -mode kshortest \
@@ -184,7 +195,7 @@ for branch in "${BRANCHES[@]}"; do
               -label "$label" \
               $refresh \
               -out "$out" \
-         ) 2>&1 | tee "$LOG_DIR/bench-kshortest-$branch.log"; then
+         ) 2>&1 | tee "$LOG_DIR/bench-kshortest-$branch-$RUN_TAG.log"; then
         warn "[$branch] bench invocation failed -- see log"
         # If alpha died mid-run (e.g. OOM-killed under the memory cap), say so
         # and surface its log -- that's the difference between "bench bug" and
@@ -192,7 +203,7 @@ for branch in "${BRANCHES[@]}"; do
         apid=$(cat /tmp/dgraph-alpha.pid 2>/dev/null || true)
         if [[ -z "$apid" ]] || ! kill -0 "$apid" 2>/dev/null; then
             warn "[$branch] alpha is no longer running -- likely OOM-killed or crashed mid-bench"
-            tail_log "[$branch] alpha" "$LOG_DIR/alpha-kshortest-$branch.log"
+            tail_log "[$branch] alpha" "$alpha_log"
         fi
     fi
     [[ -n "${pprof_pid:-}" ]] && wait "$pprof_pid" 2>/dev/null || true
@@ -211,7 +222,7 @@ for fr in ${FRONTIERS//,/ }; do
     flabel=$fr; [[ "$fr" == "0" ]] && flabel="unlimited"
     printf '%-12s' "$flabel"
     for b in "${BRANCHES[@]}"; do
-        f="$KS_DIR/${b}-${DATASET}.json"
+        f="$KS_DIR/${b}-${DATASET}-${RUN_TAG}.json"
         if [[ -f "$f" ]]; then
             cell=$(jq -r --argjson fr "$fr" '.frontiers[]? | select(.max_frontier==$fr)
                 | "\(.correct_of_returned_pct|floor)%(r\(.returned) t\(.timeouts))"' "$f" 2>/dev/null)
@@ -222,6 +233,6 @@ for fr in ${FRONTIERS//,/ }; do
     done
     echo
 done
-log "results: $KS_DIR (per-branch JSONs carry full per-target detail)"
-log "pprof:   $KS_DIR/pprof-cpu-<branch>.prof  -> verify eviction with: go tool pprof -top <file> | grep -iE 'removeMax|pq.Pop|expandOut'"
+log "results: $KS_DIR/*-${RUN_TAG}.json (per-branch JSONs carry full per-target detail)"
+log "pprof:   $KS_DIR/pprof-cpu-<branch>-$RUN_TAG.prof  -> verify eviction with: go tool pprof -top <file> | grep -iE 'removeMax|pq.Pop|expandOut'"
 log "master log: $MASTER_LOG"
