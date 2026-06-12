@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# launch-pr.sh -- from-scratch, one-command launch of a single PR's kshortest
-# run: kills stray bench/alpha processes (never zero), ensures zero is running
+# launch-pr.sh -- from-scratch, one-command launch of a kshortest sweep over
+# one or more branches: kills stray bench/alpha processes (never zero), ensures zero is running
 # as a persistent systemd unit (dgraph-zero: reboot-proof, restart-on-failure,
 # OOM-protected, never restarted while healthy), then launches
 # run-kshortest-all.sh detached. Exists so the operator never has to paste a
@@ -14,11 +14,16 @@
 # nohup (uncapped -- the old freeze-prone behavior) only if systemd-run or
 # passwordless sudo is unavailable.
 #
-#   ./scripts/launch-pr.sh pr-9599
+#   ./scripts/launch-pr.sh pr-9599                       # one branch
+#   ./scripts/launch-pr.sh main pr-9599 pr-9607          # several branches, one sweep
+#   ./scripts/launch-pr.sh all                           # main + all 4 PRs
+#
+# Multi-branch runs share one unit/run-tag and end with the cross-branch
+# summary table; the uid map is fetched once (first branch) and reused.
 #
 # Every run is tagged with a timestamp (RUN_TAG): output files are never
-# overwritten across launches. results/sweep-<pr>-latest.out always points at
-# the newest run.
+# overwritten across launches. results/sweep-<label>-latest.out always points
+# at the newest run.
 #
 # Watch:   tail -f results/sweep-<pr>-latest.out  (or: journalctl -u dgraph-bench-<pr> -f)
 # Status:  jq '.frontiers|length' /srv/results-run2/kshortest/<pr>-roadCOL-<run_tag>.json
@@ -28,7 +33,15 @@
 # baseline row, opt in per-run: FRONTIERS="100,1000,5000,0" ./scripts/launch-pr.sh <pr>
 set -euo pipefail
 
-PR="${1:?usage: launch-pr.sh <branch, e.g. pr-9599>}"
+[[ $# -ge 1 ]] || { echo "usage: launch-pr.sh <branch ...|all>  (e.g. 'pr-9599' or 'all')" >&2; exit 1; }
+if [[ "$1" == "all" ]]; then
+    BRANCHES="main pr-9576 pr-9599 pr-9607 pr-9678"
+    LABEL="all"
+else
+    BRANCHES="$*"
+    # LABEL names the unit and output files; systemd unit names forbid spaces.
+    if (( $# == 1 )); then LABEL="$1"; else LABEL=$(printf '%s' "$BRANCHES" | tr ' ' '-'); fi
+fi
 BENCH_DIR="${BENCH_DIR:-/srv/shortest-path-bench}"
 RESULTS_DIR="${RESULTS_DIR:-/srv/results-run2}"
 DATASET="${DATASET_OVERRIDE:-roadCOL}"
@@ -131,17 +144,17 @@ fi
 
 # 3. launch detached -- memory-capped systemd transient unit, nohup fallback.
 #    RUN_TAG suffixes every artifact of this run (.out, JSONs, logs, pprof) so
-#    a re-launch NEVER overwrites a previous run; sweep-$PR-latest.out is a
+#    a re-launch NEVER overwrites a previous run; sweep-$LABEL-latest.out is a
 #    convenience symlink to the newest run's output.
 cd "$BENCH_DIR"
 mkdir -p results
 RUN_TAG="$(date +%Y%m%d-%H%M%S)"
-OUT="$BENCH_DIR/results/sweep-$PR-$RUN_TAG.out"
+OUT="$BENCH_DIR/results/sweep-$LABEL-$RUN_TAG.out"
 : > "$OUT"
-ln -sfn "$OUT" "$BENCH_DIR/results/sweep-$PR-latest.out"
+ln -sfn "$OUT" "$BENCH_DIR/results/sweep-$LABEL-latest.out"
 
 if (( HAVE_SYSTEMD )); then
-    UNIT="dgraph-bench-$PR"
+    UNIT="dgraph-bench-$LABEL"
     sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
     # The unit starts with a CLEAN environment: tuning vars set on the
     # launch-pr.sh command line (e.g. FRONTIERS=...,0 for the unlimited row)
@@ -161,23 +174,25 @@ if (( HAVE_SYSTEMD )); then
         -p "Environment=PATH=$PATH" \
         -p "Environment=RESULTS_DIR=$RESULTS_DIR" \
         -p "Environment=DATASET_OVERRIDE=$DATASET" \
-        -p "Environment=BRANCHES_OVERRIDE=$PR" \
+        -p "Environment=BRANCHES_OVERRIDE=$BRANCHES" \
         -p "Environment=RUN_TAG=$RUN_TAG" \
         ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
         "$BENCH_DIR/scripts/run-kshortest-all.sh"
-    echo "[launch] $PR started as unit $UNIT (MemoryMax=$MEMORY_MAX MemorySwapMax=$MEMORY_SWAP_MAX)"
+    echo "[launch] '$BRANCHES' started as unit $UNIT (MemoryMax=$MEMORY_MAX MemorySwapMax=$MEMORY_SWAP_MAX)"
     echo "[launch] unit:    systemctl status $UNIT  |  journalctl -u $UNIT -f"
 else
     echo "[launch] WARN: systemd-run/sudo unavailable -- falling back to nohup (NO memory cap;" >&2
     echo "[launch] WARN: a runaway query can exhaust RAM -- see dgraph-bench-rca)" >&2
-    nohup env RESULTS_DIR="$RESULTS_DIR" DATASET_OVERRIDE="$DATASET" BRANCHES_OVERRIDE="$PR" \
+    nohup env RESULTS_DIR="$RESULTS_DIR" DATASET_OVERRIDE="$DATASET" BRANCHES_OVERRIDE="$BRANCHES" \
         RUN_TAG="$RUN_TAG" \
         ./scripts/run-kshortest-all.sh > "$OUT" 2>&1 &
     disown
-    echo "[launch] $PR started (pid $!)"
+    echo "[launch] '$BRANCHES' started (pid $!)"
 fi
 echo "[launch] run tag: $RUN_TAG"
 echo "[launch] watch:   tail -f $OUT"
-echo "[launch]          (or: tail -f $BENCH_DIR/results/sweep-$PR-latest.out)"
+echo "[launch]          (or: tail -f $BENCH_DIR/results/sweep-$LABEL-latest.out)"
 echo "[launch] memlog:  $RESULTS_DIR/logs/memlog-$RUN_TAG.log"
-echo "[launch] status:  jq '.frontiers|length' $RESULTS_DIR/kshortest/$PR-$DATASET-$RUN_TAG.json"
+for b in $BRANCHES; do
+    echo "[launch] status:  jq '.frontiers|length' $RESULTS_DIR/kshortest/$b-$DATASET-$RUN_TAG.json"
+done
