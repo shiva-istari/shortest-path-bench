@@ -158,10 +158,13 @@ if (( HAVE_SYSTEMD )); then
     sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
     # The unit starts with a CLEAN environment: tuning vars set on the
     # launch-pr.sh command line (e.g. FRONTIERS=...,0 for the unlimited row)
-    # must be forwarded explicitly or they silently vanish.
+    # must be forwarded explicitly or they silently vanish. Use --setenv, NOT
+    # -p Environment=: the latter splits its value on spaces as multiple
+    # VAR=val assignments, so a multi-branch BRANCHES_OVERRIDE ("main pr-...")
+    # is rejected as "Invalid environment block".
     EXTRA_ENV=()
     for var in FRONTIERS TIMEOUT TARGETS NUMPATHS SEED BANDLO BANDHI TOL CAPTURE_PPROF; do
-        [[ -n "${!var:-}" ]] && EXTRA_ENV+=( -p "Environment=$var=${!var}" )
+        [[ -n "${!var:-}" ]] && EXTRA_ENV+=( --setenv="$var=${!var}" )
     done
     sudo systemd-run --unit="$UNIT" --collect \
         -p MemoryMax="$MEMORY_MAX" \
@@ -170,12 +173,12 @@ if (( HAVE_SYSTEMD )); then
         -p "WorkingDirectory=$BENCH_DIR" \
         -p "StandardOutput=append:$OUT" \
         -p "StandardError=append:$OUT" \
-        -p "Environment=HOME=$HOME" \
-        -p "Environment=PATH=$PATH" \
-        -p "Environment=RESULTS_DIR=$RESULTS_DIR" \
-        -p "Environment=DATASET_OVERRIDE=$DATASET" \
-        -p "Environment=BRANCHES_OVERRIDE=$BRANCHES" \
-        -p "Environment=RUN_TAG=$RUN_TAG" \
+        --setenv=HOME="$HOME" \
+        --setenv=PATH="$PATH" \
+        --setenv=RESULTS_DIR="$RESULTS_DIR" \
+        --setenv=DATASET_OVERRIDE="$DATASET" \
+        --setenv=BRANCHES_OVERRIDE="$BRANCHES" \
+        --setenv=RUN_TAG="$RUN_TAG" \
         ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
         "$BENCH_DIR/scripts/run-kshortest-all.sh"
     echo "[launch] '$BRANCHES' started as unit $UNIT (MemoryMax=$MEMORY_MAX MemorySwapMax=$MEMORY_SWAP_MAX)"
