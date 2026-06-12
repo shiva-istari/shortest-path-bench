@@ -29,7 +29,7 @@
 #   ALPHA_DIR=/srv/db                   ALPHA_DIR_PREFIX_ALLOW=/srv/
 #   BRANCHES_OVERRIDE="main pr-9576 pr-9599 pr-9607 pr-9678"
 #   DATASET_OVERRIDE=roadCOL
-#   NUMPATHS=2  TARGETS=30  FRONTIERS="0,10000,1000,100"
+#   NUMPATHS=2  TARGETS=30  FRONTIERS="100,1000,10000,0"
 #   BANDLO=0.0005  BANDHI=0.004  TOL=0.0001  TIMEOUT=30s  SEED=1
 
 set -euo pipefail
@@ -45,7 +45,12 @@ DATASET="${DATASET_OVERRIDE:-roadCOL}"
 
 NUMPATHS="${NUMPATHS:-2}"
 TARGETS="${TARGETS:-100}"          # more targets -> resolves small main-vs-PR differences
-FRONTIERS="${FRONTIERS:-0,10000,1000,100}"
+# Capped frontiers FIRST, unlimited (0) LAST. The unlimited row is the only
+# memory-unbounded one (numpaths=2, no eviction cap) and so the only realistic
+# OOM-kill candidate under the 48G cgroup cap. Results persist after each
+# frontier, so this order guarantees the eviction-correctness rows -- the ones
+# the verdict rests on -- are already on disk if the unlimited baseline dies.
+FRONTIERS="${FRONTIERS:-100,1000,10000,0}"
 BANDLO="${BANDLO:-0.0005}"
 BANDHI="${BANDHI:-0.004}"
 TOL="${TOL:-0.0001}"
@@ -65,11 +70,12 @@ LOG_DIR="$RESULTS_DIR/logs"
 # Datasets array (single dataset here) so alpha.sh guard_rm_target protects it.
 DATASETS=( "$DATASET" )
 source "$(dirname "${BASH_SOURCE[0]}")/lib/alpha.sh"
-trap alpha_cleanup_on_exit EXIT
+trap 'stop_memlog; alpha_cleanup_on_exit' EXIT
 
 # ---- pre-flight (no destructive ops) ---------------------------------------
 mkdir -p "$KS_DIR" "$LOG_DIR"
 log "================ run-kshortest-all.sh ================"
+preflight_memory   # abort if a previous run is still hogging RAM; warn if no swap
 for bin in dgraph go git make curl jq awk; do command -v "$bin" >/dev/null || die "$bin not on PATH"; done
 [[ -d "$BENCH_DIR" ]]   || die "BENCH_DIR not found: $BENCH_DIR"
 [[ -d "$DGRAPH_REPO" ]] || die "DGRAPH_REPO not found: $DGRAPH_REPO"
@@ -94,6 +100,7 @@ log "        frontiers=$FRONTIERS band=[$BANDLO,$BANDHI] timeout=$TIMEOUT bulk_p
 
 MASTER_LOG="$LOG_DIR/kshortest-$(date +%Y%m%d-%H%M%S).log"
 exec > >(tee -a "$MASTER_LOG") 2>&1
+start_memlog "$LOG_DIR/memlog-$(date +%Y%m%d-%H%M%S).log"   # post-mortem RAM/RSS trace
 stop_alpha
 
 # ---- sweep -----------------------------------------------------------------
@@ -125,6 +132,7 @@ for branch in "${BRANCHES[@]}"; do
     start_alpha "$LOG_DIR/alpha-kshortest-$branch.log"
     if ! wait_alpha; then
         warn "[$branch] alpha unhealthy in ${ALPHA_HEALTH_TIMEOUT_SEC}s -- skipping"
+        tail_log "[$branch] alpha" "$LOG_DIR/alpha-kshortest-$branch.log"
         stop_alpha; continue
     fi
 
@@ -178,6 +186,14 @@ for branch in "${BRANCHES[@]}"; do
               -out "$out" \
          ) 2>&1 | tee "$LOG_DIR/bench-kshortest-$branch.log"; then
         warn "[$branch] bench invocation failed -- see log"
+        # If alpha died mid-run (e.g. OOM-killed under the memory cap), say so
+        # and surface its log -- that's the difference between "bench bug" and
+        # "alpha ran out of memory".
+        apid=$(cat /tmp/dgraph-alpha.pid 2>/dev/null || true)
+        if [[ -z "$apid" ]] || ! kill -0 "$apid" 2>/dev/null; then
+            warn "[$branch] alpha is no longer running -- likely OOM-killed or crashed mid-bench"
+            tail_log "[$branch] alpha" "$LOG_DIR/alpha-kshortest-$branch.log"
+        fi
     fi
     [[ -n "${pprof_pid:-}" ]] && wait "$pprof_pid" 2>/dev/null || true
     stop_alpha

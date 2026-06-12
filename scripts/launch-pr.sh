@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
 # launch-pr.sh -- from-scratch, one-command launch of a single PR's kshortest
-# run: kills stray bench/alpha processes, starts zero if it's down, then
-# launches run-kshortest-all.sh fully detached (nohup + disown). Exists so the
-# operator never has to paste a long fragile command line into a terminal.
+# run: kills stray bench/alpha processes (never zero), ensures zero is running
+# as a persistent systemd unit (dgraph-zero: reboot-proof, restart-on-failure,
+# OOM-protected, never restarted while healthy), then launches
+# run-kshortest-all.sh detached. Exists so the operator never has to paste a
+# long fragile command line into a terminal.
+#
+# Detach mechanism (dgraph-bench-rca, RCA-1/RCA-3): the whole sweep runs inside
+# a systemd-run transient unit with a hard memory ceiling. If Dgraph eats past
+# MEMORY_MAX the kernel OOM-kills it INSIDE the cgroup -- the VM and sshd stay
+# alive instead of freezing, and the sweep logs the failure and moves on. The
+# unit also gets journald logging on top of the file log. Falls back to plain
+# nohup (uncapped -- the old freeze-prone behavior) only if systemd-run or
+# passwordless sudo is unavailable.
 #
 #   ./scripts/launch-pr.sh pr-9599
 #
-# Watch:   tail -f results/sweep-<pr>.out
+# Watch:   tail -f results/sweep-<pr>.out      (or: journalctl -u dgraph-bench-<pr> -f)
 # Status:  jq '.frontiers|length' /srv/results-run2/kshortest/<pr>-roadCOL.json
 #          (4 = all frontiers done)
 set -euo pipefail
@@ -16,33 +26,129 @@ BENCH_DIR="${BENCH_DIR:-/srv/shortest-path-bench}"
 RESULTS_DIR="${RESULTS_DIR:-/srv/results-run2}"
 DATASET="${DATASET_OVERRIDE:-roadCOL}"
 ZERO_DIR="${ZERO_DIR:-/srv/db/zero-setup}"
+# 48G cap leaves 16G of the 64G VM for the OS, sshd, zero, and the Go bench
+# client; 32G swap cap matches the swapfile provisioned per the RCA.
+MEMORY_MAX="${MEMORY_MAX:-48G}"
+MEMORY_SWAP_MAX="${MEMORY_SWAP_MAX:-32G}"
 
-# 1. stop stale bench/alpha (never zero unless it's dead -- it serves all runs)
+# Single systemd-availability check, used by both the zero unit (step 2) and
+# the capped bench unit (step 3).
+HAVE_SYSTEMD=0
+if [[ "${USE_SYSTEMD_RUN:-1}" == "1" ]] && command -v systemd-run >/dev/null 2>&1 \
+        && sudo -n true 2>/dev/null; then
+    HAVE_SYSTEMD=1
+fi
+
+# 1. stop stale bench/alpha. ZERO IS NEVER TOUCHED HERE: it is shared infra
+#    holding uid-lease state for every branch/PR run -- the patterns below
+#    deliberately match only alpha/bench, and the 'dgraph-bench-*' unit glob
+#    cannot match dgraph-zero.
+sudo -n systemctl stop 'dgraph-bench-*' 2>/dev/null || true
 pkill -f run-kshortest-all 2>/dev/null || true
 pkill -f 'cmd/bench'       2>/dev/null || true
 pkill -f 'dgraph alpha'    2>/dev/null || true
 sleep 2
 
-# 2. ensure zero
-if ! curl -s -m 3 localhost:6080/state >/dev/null; then
-    echo "[launch] zero down -- starting it in $ZERO_DIR"
-    pkill -f 'dgraph zero' 2>/dev/null || true
-    sleep 1
-    mkdir -p "$ZERO_DIR"
-    ( cd "$ZERO_DIR" && nohup dgraph zero --my=localhost:5080 --replicas=1 > zero.log 2>&1 & )
-    sleep 6
-    curl -s -m 3 localhost:6080/state >/dev/null \
-        || { echo "[launch] ZERO FAILED -- see $ZERO_DIR/zero.log"; exit 1; }
-fi
-echo "[launch] zero up"
+# 2. ensure zero -- persistent systemd unit: survives reboots (the last RCA-3
+#    nohup gap), auto-restarts on failure, negative OOM score so the kernel
+#    avoids killing it, and its own small cgroup fully separate from the bench
+#    unit's 48G cap. A HEALTHY ZERO IS NEVER RESTARTED -- re-running this
+#    script across PRs leaves it alone; we only start it when /state is down.
+zero_up() { curl -s -m 3 localhost:6080/state >/dev/null; }
 
-# 3. launch detached
+if (( HAVE_SYSTEMD )); then
+    DGRAPH_BIN=$(command -v dgraph) || { echo "[launch] dgraph not on PATH"; exit 1; }
+    mkdir -p "$ZERO_DIR"
+    UNIT_FILE=/etc/systemd/system/dgraph-zero.service
+    desired="[Unit]
+Description=Dgraph Zero (shared bench infra -- do not stop between PR runs)
+After=network.target
+
+[Service]
+Type=simple
+User=$(id -un)
+WorkingDirectory=$ZERO_DIR
+ExecStart=$DGRAPH_BIN zero --my=localhost:5080 --replicas=1
+Restart=on-failure
+RestartSec=5
+MemoryMax=4G
+OOMScoreAdjust=-500
+StandardOutput=append:$ZERO_DIR/zero.log
+StandardError=append:$ZERO_DIR/zero.log
+
+[Install]
+WantedBy=multi-user.target"
+    if [[ ! -f "$UNIT_FILE" ]] || ! diff -q <(printf '%s\n' "$desired") "$UNIT_FILE" >/dev/null 2>&1; then
+        printf '%s\n' "$desired" | sudo tee "$UNIT_FILE" >/dev/null
+        sudo systemctl daemon-reload
+        echo "[launch] wrote $UNIT_FILE"
+    fi
+    sudo systemctl enable dgraph-zero >/dev/null 2>&1 || true
+
+    if zero_up; then
+        if systemctl is-active --quiet dgraph-zero; then
+            echo "[launch] zero up (systemd unit dgraph-zero) -- not touching it"
+        else
+            # Legacy nohup zero still serving: leave it alone (killing it would
+            # drop live uid-lease state). The enabled unit takes over from the
+            # same $ZERO_DIR after the next reboot.
+            echo "[launch] zero up (legacy non-systemd process) -- leaving it alone;"
+            echo "[launch] dgraph-zero unit is enabled and takes over on next reboot"
+        fi
+    else
+        pkill -f 'dgraph zero' 2>/dev/null || true   # clear any wedged remnant
+        sleep 1
+        sudo systemctl restart dgraph-zero
+        for _ in $(seq 1 15); do zero_up && break; sleep 2; done
+        zero_up || { echo "[launch] ZERO FAILED -- journalctl -u dgraph-zero -n 50"; exit 1; }
+        echo "[launch] zero started (systemd unit dgraph-zero)"
+    fi
+else
+    # nohup fallback (no systemd / no passwordless sudo) -- old behavior
+    if ! zero_up; then
+        echo "[launch] zero down -- starting it in $ZERO_DIR (nohup fallback)"
+        pkill -f 'dgraph zero' 2>/dev/null || true
+        sleep 1
+        mkdir -p "$ZERO_DIR"
+        ( cd "$ZERO_DIR" && nohup dgraph zero --my=localhost:5080 --replicas=1 > zero.log 2>&1 & )
+        sleep 6
+        zero_up || { echo "[launch] ZERO FAILED -- see $ZERO_DIR/zero.log"; exit 1; }
+    fi
+    echo "[launch] zero up"
+fi
+
+# 3. launch detached -- memory-capped systemd transient unit, nohup fallback
 cd "$BENCH_DIR"
 mkdir -p results
 OUT="$BENCH_DIR/results/sweep-$PR.out"
-nohup env RESULTS_DIR="$RESULTS_DIR" DATASET_OVERRIDE="$DATASET" BRANCHES_OVERRIDE="$PR" \
-    ./scripts/run-kshortest-all.sh > "$OUT" 2>&1 &
-disown
-echo "[launch] $PR started (pid $!)"
+: > "$OUT"
+
+if (( HAVE_SYSTEMD )); then
+    UNIT="dgraph-bench-$PR"
+    sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
+    sudo systemd-run --unit="$UNIT" --collect \
+        -p MemoryMax="$MEMORY_MAX" \
+        -p MemorySwapMax="$MEMORY_SWAP_MAX" \
+        -p "User=$(id -un)" \
+        -p "WorkingDirectory=$BENCH_DIR" \
+        -p "StandardOutput=append:$OUT" \
+        -p "StandardError=append:$OUT" \
+        -p "Environment=HOME=$HOME" \
+        -p "Environment=PATH=$PATH" \
+        -p "Environment=RESULTS_DIR=$RESULTS_DIR" \
+        -p "Environment=DATASET_OVERRIDE=$DATASET" \
+        -p "Environment=BRANCHES_OVERRIDE=$PR" \
+        "$BENCH_DIR/scripts/run-kshortest-all.sh"
+    echo "[launch] $PR started as unit $UNIT (MemoryMax=$MEMORY_MAX MemorySwapMax=$MEMORY_SWAP_MAX)"
+    echo "[launch] unit:    systemctl status $UNIT  |  journalctl -u $UNIT -f"
+else
+    echo "[launch] WARN: systemd-run/sudo unavailable -- falling back to nohup (NO memory cap;" >&2
+    echo "[launch] WARN: a runaway query can exhaust RAM -- see dgraph-bench-rca)" >&2
+    nohup env RESULTS_DIR="$RESULTS_DIR" DATASET_OVERRIDE="$DATASET" BRANCHES_OVERRIDE="$PR" \
+        ./scripts/run-kshortest-all.sh > "$OUT" 2>&1 &
+    disown
+    echo "[launch] $PR started (pid $!)"
+fi
 echo "[launch] watch:   tail -f $OUT"
+echo "[launch] memlog:  ls -t $RESULTS_DIR/logs/memlog-*.log | head -1"
 echo "[launch] status:  jq '.frontiers|length' $RESULTS_DIR/kshortest/$PR-$DATASET.json"

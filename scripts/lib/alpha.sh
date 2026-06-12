@@ -33,10 +33,15 @@
 #   start_alpha <logfile>       -- launch alpha (background), record pid
 #   require_zero [url]          -- die unless Zero is reachable
 #   to_seconds <dur>            -- "5m"/"60s"/"90" -> integer seconds
+#   preflight_memory            -- abort if RAM already low; warn if no swap
+#   start_memlog <logfile>      -- background free/RSS sampler (post-mortem data)
+#   stop_memlog                 -- kill the sampler (call from EXIT trap)
+#   tail_log <label> <logfile>  -- emit last 50 lines of a log to stderr
 #   alpha_cleanup_on_exit       -- EXIT-trap target; stops alpha if we started it
 #
 # State maintained:
 #   RUNNING_ALPHA               -- 0/1 flag, set by start_alpha / stop_alpha
+#   MEMLOG_PID                  -- pid of the memory sampler, set by start_memlog
 #   /tmp/dgraph-alpha.pid       -- pid file written by start_alpha
 
 ALPHA_HEALTH_TIMEOUT_SEC="${ALPHA_HEALTH_TIMEOUT_SEC:-300}"
@@ -173,6 +178,65 @@ to_seconds() {
         *s) echo "${v%s}" ;;
         *)  echo "$v" ;;
     esac
+}
+
+# Pre-flight memory check (RCA 5.4). The VM-freeze incident started from runs
+# launched while a previous run's alpha was still resident: abort early instead
+# of starting a sweep that will hit the memory ceiling an hour in. Also verify
+# swap survived the last reboot -- no swap means RAM exhaustion freezes the VM
+# instead of OOM-killing alpha (RCA-1).
+preflight_memory() {
+    [[ -r /proc/meminfo ]] || { warn "preflight_memory: /proc/meminfo unreadable -- skipping check"; return 0; }
+    local min_mb="${MIN_AVAIL_MB:-8192}"
+    local avail_mb swap_total_mb swap_free_mb
+    avail_mb=$(awk '/^MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+    swap_total_mb=$(awk '/^SwapTotal/ {print int($2/1024)}' /proc/meminfo)
+    swap_free_mb=$(awk '/^SwapFree/ {print int($2/1024)}' /proc/meminfo)
+    log "preflight: available RAM ${avail_mb} MB | swap free ${swap_free_mb}/${swap_total_mb} MB"
+    if (( swap_total_mb == 0 )); then
+        warn "NO SWAP configured -- RAM exhaustion will freeze the whole VM, not just alpha (see dgraph-bench-rca)"
+    fi
+    if (( avail_mb < min_mb )); then
+        die "only ${avail_mb} MB RAM available (< ${min_mb} MB) -- a previous run is likely still resident; refusing to start"
+    fi
+}
+
+# Background memory sampler (RCA 5.3): free + dgraph RSS every
+# MEMLOG_INTERVAL_SEC (default 10s). Gives post-mortem data even if the run
+# dies -- the last lines show whether we were climbing into the ceiling.
+start_memlog() {
+    local memlog="$1"
+    (
+      while true; do
+        {
+          echo "=== $(date -u +'%Y-%m-%d %H:%M:%S') ==="
+          free -m 2>/dev/null | grep -E 'Mem|Swap'
+          # shellcheck disable=SC2009  # pgrep can't give RSS+CPU in one shot
+          ps aux --sort=-%mem 2>/dev/null | grep '[d]graph' | head -3 \
+              | awk '{printf "%s pid=%s cpu=%s%% rss=%.0fMB\n", $11" "$12, $2, $3, $6/1024}'
+        } >> "$memlog"
+        sleep "${MEMLOG_INTERVAL_SEC:-10}"
+      done
+    ) &
+    MEMLOG_PID=$!
+    log "memlog: sampling every ${MEMLOG_INTERVAL_SEC:-10}s -> $memlog (pid $MEMLOG_PID)"
+}
+
+stop_memlog() {
+    if [[ -n "${MEMLOG_PID:-}" ]] && kill -0 "$MEMLOG_PID" 2>/dev/null; then
+        kill "$MEMLOG_PID" 2>/dev/null || true
+    fi
+    MEMLOG_PID=""
+}
+
+# Last-50-lines dump for failure paths (RCA 5.6): when alpha goes unhealthy or
+# a bench invocation fails, the cause is usually in the alpha log -- surface it
+# in the master log instead of making the operator go hunting.
+tail_log() {
+    local label="$1" logfile="$2"
+    [[ -f "$logfile" ]] || { warn "$label: no log at $logfile"; return 0; }
+    warn "$label: last 50 lines of $logfile:"
+    tail -50 "$logfile" >&2 || true
 }
 
 alpha_cleanup_on_exit() {
