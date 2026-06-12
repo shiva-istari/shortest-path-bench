@@ -31,7 +31,7 @@
 #   ALPHA_DIR=/srv/db                   ALPHA_DIR_PREFIX_ALLOW=/srv/
 #   BRANCHES_OVERRIDE="main pr-9576 pr-9599 pr-9607 pr-9678"
 #   DATASET_OVERRIDE=roadCOL
-#   NUMPATHS=2  TARGETS=30  FRONTIERS="100,1000,10000,0"
+#   NUMPATHS=2  TARGETS=30  FRONTIERS="100,1000,5000"  (add ,0 for unlimited)
 #   BANDLO=0.0005  BANDHI=0.004  TOL=0.0001  TIMEOUT=30s  SEED=1
 #   RUN_TAG=<ts>  -- suffix for all output files (default: launch timestamp)
 
@@ -48,12 +48,16 @@ DATASET="${DATASET_OVERRIDE:-roadCOL}"
 
 NUMPATHS="${NUMPATHS:-2}"
 TARGETS="${TARGETS:-100}"          # more targets -> resolves small main-vs-PR differences
-# Capped frontiers FIRST, unlimited (0) LAST. The unlimited row is the only
-# memory-unbounded one (numpaths=2, no eviction cap) and so the only realistic
-# OOM-kill candidate under the 48G cgroup cap. Results persist after each
-# frontier, so this order guarantees the eviction-correctness rows -- the ones
-# the verdict rests on -- are already on disk if the unlimited baseline dies.
-FRONTIERS="${FRONTIERS:-100,1000,10000,0}"
+# CAPPED frontiers only by default. The unlimited row (0) is memory-unbounded
+# (numpaths=2, no eviction cap), slow, and its scientific job -- proving the
+# wrongness is eviction-specific -- is already done: 2026-06-10 sweep gave
+# unlimited baselines for all 5 branches (80/0/80/80/80%), and run
+# 20260612-082535 confirmed pr-9599 at 37/37=100% correct uncapped. Top cap is
+# 5000, not 10000: at 10000 44/100 targets timed out (60s), so that row mostly
+# measured the timeout ceiling, and it cost ~48min. Opt back in per-run with
+# FRONTIERS="100,1000,5000,0" (keep 0 LAST: results persist per-frontier, so
+# the verdict rows survive an OOM on the unlimited row).
+FRONTIERS="${FRONTIERS:-100,1000,5000}"
 BANDLO="${BANDLO:-0.0005}"
 BANDHI="${BANDHI:-0.004}"
 TOL="${TOL:-0.0001}"

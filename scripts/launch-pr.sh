@@ -22,7 +22,10 @@
 #
 # Watch:   tail -f results/sweep-<pr>-latest.out  (or: journalctl -u dgraph-bench-<pr> -f)
 # Status:  jq '.frontiers|length' /srv/results-run2/kshortest/<pr>-roadCOL-<run_tag>.json
-#          (4 = all frontiers done; exact path printed at launch)
+#          (3 = all default frontiers done; exact path printed at launch)
+#
+# Default sweep is CAPPED frontiers only (100,1000,5000). For the unlimited
+# baseline row, opt in per-run: FRONTIERS="100,1000,5000,0" ./scripts/launch-pr.sh <pr>
 set -euo pipefail
 
 PR="${1:?usage: launch-pr.sh <branch, e.g. pr-9599>}"
@@ -140,6 +143,13 @@ ln -sfn "$OUT" "$BENCH_DIR/results/sweep-$PR-latest.out"
 if (( HAVE_SYSTEMD )); then
     UNIT="dgraph-bench-$PR"
     sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
+    # The unit starts with a CLEAN environment: tuning vars set on the
+    # launch-pr.sh command line (e.g. FRONTIERS=...,0 for the unlimited row)
+    # must be forwarded explicitly or they silently vanish.
+    EXTRA_ENV=()
+    for var in FRONTIERS TIMEOUT TARGETS NUMPATHS SEED BANDLO BANDHI TOL CAPTURE_PPROF; do
+        [[ -n "${!var:-}" ]] && EXTRA_ENV+=( -p "Environment=$var=${!var}" )
+    done
     sudo systemd-run --unit="$UNIT" --collect \
         -p MemoryMax="$MEMORY_MAX" \
         -p MemorySwapMax="$MEMORY_SWAP_MAX" \
@@ -153,6 +163,7 @@ if (( HAVE_SYSTEMD )); then
         -p "Environment=DATASET_OVERRIDE=$DATASET" \
         -p "Environment=BRANCHES_OVERRIDE=$PR" \
         -p "Environment=RUN_TAG=$RUN_TAG" \
+        ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"} \
         "$BENCH_DIR/scripts/run-kshortest-all.sh"
     echo "[launch] $PR started as unit $UNIT (MemoryMax=$MEMORY_MAX MemorySwapMax=$MEMORY_SWAP_MAX)"
     echo "[launch] unit:    systemctl status $UNIT  |  journalctl -u $UNIT -f"
