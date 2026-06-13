@@ -48,16 +48,14 @@ DATASET="${DATASET_OVERRIDE:-roadCOL}"
 
 NUMPATHS="${NUMPATHS:-2}"
 TARGETS="${TARGETS:-100}"          # more targets -> resolves small main-vs-PR differences
-# CAPPED frontiers only by default. The unlimited row (0) is memory-unbounded
-# (numpaths=2, no eviction cap), slow, and its scientific job -- proving the
-# wrongness is eviction-specific -- is already done: 2026-06-10 sweep gave
-# unlimited baselines for all 5 branches (80/0/80/80/80%), and run
-# 20260612-082535 confirmed pr-9599 at 37/37=100% correct uncapped. Top cap is
-# 5000, not 10000: at 10000 44/100 targets timed out (60s), so that row mostly
-# measured the timeout ceiling, and it cost ~48min. Opt back in per-run with
-# FRONTIERS="100,1000,5000,0" (keep 0 LAST: results persist per-frontier, so
-# the verdict rows survive an OOM on the unlimited row).
-FRONTIERS="${FRONTIERS:-100,1000,5000}"
+# CAPPED frontiers only by default. Top cap is 2000, not 5000: at frontier=5000
+# on roadCOL alpha RSS reached ~47.6G (within the 48G MemoryMax) and was
+# OOM-killed, aborting the entire sweep (run 20260612-110453). frontier=2000
+# keeps alpha well under 40G so GOMEMLIMIT's soft GC pressure handles load
+# gracefully (queries time out rather than alpha dying). The unlimited row (0)
+# is excluded -- its job is done: eviction-specific wrongness confirmed. Opt
+# back in with FRONTIERS="100,1000,2000,0" (0 LAST so verdict rows persist).
+FRONTIERS="${FRONTIERS:-100,1000,2000}"
 BANDLO="${BANDLO:-0.0005}"
 BANDHI="${BANDHI:-0.004}"
 TOL="${TOL:-0.0001}"

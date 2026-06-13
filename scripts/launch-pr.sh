@@ -169,6 +169,7 @@ if (( HAVE_SYSTEMD )); then
     sudo systemd-run --unit="$UNIT" --collect \
         -p MemoryMax="$MEMORY_MAX" \
         -p MemorySwapMax="$MEMORY_SWAP_MAX" \
+        -p OOMPolicy=continue \
         -p "User=$(id -un)" \
         -p "WorkingDirectory=$BENCH_DIR" \
         -p "StandardOutput=append:$OUT" \

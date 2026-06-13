@@ -146,7 +146,12 @@ start_alpha() {
     local logfile="$1"
     [[ -n "${ALPHA_DIR:-}" ]] || die "ALPHA_DIR unset in caller"
     ( cd "$ALPHA_DIR"
-      nohup dgraph alpha --limit "query-edge=50000000" \
+      # GOMEMLIMIT: Go's soft memory limit. Alpha GCs aggressively before
+      # reaching this threshold so RSS stays below the 48G cgroup hard cap.
+      # Queries that need more memory slow down and hit the query timeout
+      # (counted as timeouts, not wrong answers) rather than alpha ballooning
+      # to the cap and being OOM-killed. 40G leaves 8G headroom under MemoryMax.
+      GOMEMLIMIT="${GOMEMLIMIT:-40GiB}" nohup dgraph alpha --limit "query-edge=50000000" \
           > "$logfile" 2>&1 &
       echo $! > /tmp/dgraph-alpha.pid
     )
